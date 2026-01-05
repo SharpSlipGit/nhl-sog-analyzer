@@ -32,6 +32,8 @@ from itertools import combinations
 import pytz
 import statistics
 
+# JSONBin.io for free cloud storage (no credit card required)
+
 # ============================================================================
 # PAGE CONFIG
 # ============================================================================
@@ -94,6 +96,7 @@ MIN_HIT_RATE = 70  # Lowered slightly since continuous scoring handles quality
 EST = pytz.timezone('US/Eastern')
 DATA_DIR = "nhl_sog_data"
 HISTORY_FILE = f"{DATA_DIR}/results_history.json"
+PARLAY_HISTORY_FILE = f"{DATA_DIR}/parlay_history.json"
 
 # League averages for baseline
 LEAGUE_AVG_SAG = 30.0  # Shots allowed per game
@@ -130,13 +133,86 @@ CORRELATION_PENALTIES = {
 }
 
 # ============================================================================
-# DATA PERSISTENCE
+# DATA PERSISTENCE (JSONBin.io + Local JSON Fallback)
 # ============================================================================
+# JSONBin.io is 100% FREE - no credit card required!
+# Setup: 1) Create account at jsonbin.io  2) Get API key  3) Add to Streamlit secrets
+
+JSONBIN_API_URL = "https://api.jsonbin.io/v3"
+
+def get_jsonbin_headers():
+    """Get JSONBin API headers from Streamlit secrets."""
+    try:
+        if "jsonbin" in st.secrets:
+            return {
+                "X-Master-Key": st.secrets["jsonbin"]["api_key"],
+                "Content-Type": "application/json"
+            }
+    except:
+        pass
+    return None
+
+def jsonbin_load_data(bin_key: str) -> Dict:
+    """Load data from JSONBin.io."""
+    headers = get_jsonbin_headers()
+    if not headers:
+        return None
+    
+    try:
+        bin_id = st.secrets["jsonbin"].get(bin_key)
+        if not bin_id:
+            return None
+        
+        response = requests.get(
+            f"{JSONBIN_API_URL}/b/{bin_id}/latest",
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("record", {})
+        
+    except Exception as e:
+        pass
+    
+    return None
+
+def jsonbin_save_data(bin_key: str, data: Dict) -> bool:
+    """Save data to JSONBin.io."""
+    headers = get_jsonbin_headers()
+    if not headers:
+        return False
+    
+    try:
+        bin_id = st.secrets["jsonbin"].get(bin_key)
+        if not bin_id:
+            return False
+        
+        response = requests.put(
+            f"{JSONBIN_API_URL}/b/{bin_id}",
+            headers=headers,
+            json=data,
+            timeout=10
+        )
+        
+        return response.status_code == 200
+        
+    except Exception as e:
+        return False
+
 def ensure_data_dir():
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
 def load_history() -> Dict:
+    """Load results history from JSONBin (or local JSON fallback)."""
+    # Try JSONBin first
+    cloud_data = jsonbin_load_data("results_bin_id")
+    if cloud_data is not None:
+        return cloud_data
+    
+    # Fall back to local JSON
     ensure_data_dir()
     if os.path.exists(HISTORY_FILE):
         try:
@@ -147,9 +223,48 @@ def load_history() -> Dict:
     return {}
 
 def save_history(history: Dict):
+    """Save results history to JSONBin (and local JSON as backup)."""
+    # Always save to local JSON as backup
     ensure_data_dir()
     with open(HISTORY_FILE, 'w') as f:
         json.dump(history, f, indent=2)
+    
+    # Also save to JSONBin if available
+    jsonbin_save_data("results_bin_id", history)
+
+def load_parlay_history() -> Dict:
+    """Load parlay history from JSONBin (or local JSON fallback)."""
+    # Try JSONBin first
+    cloud_data = jsonbin_load_data("parlay_bin_id")
+    if cloud_data is not None:
+        return cloud_data
+    
+    # Fall back to local JSON
+    ensure_data_dir()
+    if os.path.exists(PARLAY_HISTORY_FILE):
+        try:
+            with open(PARLAY_HISTORY_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_parlay_history(history: Dict):
+    """Save parlay history to JSONBin (and local JSON as backup)."""
+    # Always save to local JSON as backup
+    ensure_data_dir()
+    with open(PARLAY_HISTORY_FILE, 'w') as f:
+        json.dump(history, f, indent=2)
+    
+    # Also save to JSONBin if available
+    jsonbin_save_data("parlay_bin_id", history)
+
+def is_cloud_connected() -> bool:
+    """Check if JSONBin is properly configured."""
+    try:
+        return "jsonbin" in st.secrets and "api_key" in st.secrets["jsonbin"]
+    except:
+        return False
 
 # ============================================================================
 # SESSION STATE INIT
@@ -162,6 +277,8 @@ if 'saved_picks' not in st.session_state:
     st.session_state.saved_picks = {}
 if 'results_history' not in st.session_state:
     st.session_state.results_history = load_history()
+if 'parlay_history' not in st.session_state:
+    st.session_state.parlay_history = load_parlay_history()
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -1036,6 +1153,50 @@ def fetch_results(check_date: str, threshold: int, status_container):
     if results_found > 0:
         st.session_state.results_history[check_date] = picks
         save_history(st.session_state.results_history)
+        
+        # Update parlay results if we have a saved parlay for this date
+        if check_date in st.session_state.parlay_history:
+            parlay = st.session_state.parlay_history[check_date]
+            parlay_threshold = parlay.get("threshold", 2)
+            
+            # Build lookup from results
+            results_by_id = {}
+            results_by_name = {}
+            for pick in picks:
+                if "actual_sog" in pick:
+                    pid = str(pick.get("player_id", ""))
+                    pname = pick.get("player", "").lower().strip()
+                    results_by_id[pid] = pick
+                    if pname:
+                        results_by_name[pname] = pick
+            
+            # Check each parlay leg
+            legs_hit = 0
+            legs_checked = 0
+            for leg in parlay.get("legs", []):
+                leg_pid = str(leg.get("player_id", ""))
+                leg_name = leg.get("player_name", "").lower().strip()
+                
+                matched = None
+                if leg_pid in results_by_id:
+                    matched = results_by_id[leg_pid]
+                elif leg_name in results_by_name:
+                    matched = results_by_name[leg_name]
+                
+                if matched and "actual_sog" in matched:
+                    legs_checked += 1
+                    actual = matched["actual_sog"]
+                    leg["actual_sog"] = actual
+                    leg["hit"] = 1 if actual >= parlay_threshold else 0
+                    if leg["hit"]:
+                        legs_hit += 1
+            
+            # Update parlay result
+            if legs_checked == len(parlay.get("legs", [])):
+                parlay["legs_hit"] = legs_hit
+                parlay["result"] = "WIN" if legs_hit == len(parlay["legs"]) else "LOSS"
+                st.session_state.parlay_history[check_date] = parlay
+                save_parlay_history(st.session_state.parlay_history)
     
     if games_finished == 0:
         status_container.warning("⏳ No finished games found")
@@ -1285,6 +1446,8 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
         "parlay_score": p["parlay_score"],
         "tier": p["tier"],
         "model_prob": p["model_prob"],
+        "projection": p.get("projection", 0),
+        "std_dev": p["player"].get("std_dev", 1.5),
         "hit_rate": p["player"].get(f"hit_rate_{threshold}plus", 0),
         "threshold": threshold,
     } for p in plays]
@@ -1540,11 +1703,215 @@ def display_parlays_v7(plays: List[Dict], threshold: int, unit_size: float):
             copy_text += f"• {leg['player']['name']} O{threshold-0.5} SOG\n"
         
         st.code(copy_text, language=None)
+        
+        # Save recommended parlay for tracking
+        date_str = get_est_date()
+        parlay_to_save = {
+            "date": date_str,
+            "threshold": threshold,
+            "num_legs": best_parlay["num_legs"],
+            "probability": best_parlay["adjusted_prob"],
+            "odds": best_parlay["adjusted_odds"],
+            "legs": [{
+                "player_id": leg["player"]["player_id"],
+                "player_name": leg["player"]["name"],
+                "team": leg["player"]["team"],
+                "score": leg["parlay_score"],
+                "projection": leg.get("projection", 0),
+            } for leg in best_parlay["legs"]],
+            "result": None,  # Will be updated when results fetched
+            "legs_hit": None,
+        }
+        st.session_state.parlay_history[date_str] = parlay_to_save
+        save_parlay_history(st.session_state.parlay_history)
 
 def display_results_tracker(threshold: int):
     """Display results tracking tab."""
     
     st.subheader("📈 Results Tracker")
+    
+    # ================================================================
+    # STORAGE STATUS
+    # ================================================================
+    if is_cloud_connected():
+        st.success("☁️ **JSONBin Connected** - Data persists across deployments!")
+    else:
+        st.warning("💾 **Local Storage Only** - Data will be lost on redeploy. Set up JSONBin below for persistence.")
+    
+    # ================================================================
+    # DATA BACKUP / RESTORE / JSONBIN SETUP
+    # ================================================================
+    with st.expander("💾 Data Storage & Backup", expanded=not is_cloud_connected()):
+        
+        # Setup Tabs
+        tab_status, tab_setup, tab_backup = st.tabs(["📊 Status", "🔧 JSONBin Setup", "💾 Manual Backup"])
+        
+        with tab_status:
+            if is_cloud_connected():
+                st.success("✅ JSONBin is connected and working!")
+                st.caption("Your data automatically syncs to JSONBin after every analysis and result fetch.")
+                
+                col1, col2 = st.columns(2)
+                col1.metric("Results History", f"{len(st.session_state.results_history)} days")
+                col2.metric("Parlays Tracked", f"{len(st.session_state.parlay_history)} parlays")
+            else:
+                st.warning("JSONBin not configured. Using local storage (will be wiped on redeploy).")
+                st.markdown("👉 Go to **JSONBin Setup** tab for instructions.")
+        
+        with tab_setup:
+            st.markdown("""
+            ### Setup JSONBin.io (Free, ~3 minutes)
+            
+            **✅ 100% Free - No credit card required!**
+            
+            **Step 1: Create Account**
+            1. Go to [jsonbin.io](https://jsonbin.io)
+            2. Click **Sign Up** (use Google/GitHub or email)
+            3. Verify your email if needed
+            
+            **Step 2: Get Your API Key**
+            1. After login, click your profile icon → **API Keys**
+            2. Copy your **X-Master-Key** (looks like `$2a$10$xxxxx...`)
+            
+            **Step 3: Create Two Bins**
+            1. Click **Create a Bin** on the dashboard
+            2. Paste this as content: `{}`
+            3. Name it "NHL SOG Results" and click **Create**
+            4. Copy the **Bin ID** from the URL (looks like `67xxx...`)
+            5. **Repeat** for a second bin named "NHL SOG Parlays"
+            
+            **Step 4: Add Secrets to Streamlit**
+            1. Go to your Streamlit app at [share.streamlit.io](https://share.streamlit.io)
+            2. Click **Settings** → **Secrets**
+            3. Paste this (with your actual values):
+            
+            ```toml
+            [jsonbin]
+            api_key = "$2a$10$YOUR_API_KEY_HERE"
+            results_bin_id = "YOUR_RESULTS_BIN_ID"
+            parlay_bin_id = "YOUR_PARLAY_BIN_ID"
+            ```
+            
+            **Step 5: Redeploy**
+            - After saving secrets, your app will auto-redeploy
+            - You should see "☁️ JSONBin Connected" above!
+            
+            ---
+            **Free Tier Limits:** 10,000 requests/month (plenty for personal use)
+            """)
+        
+        with tab_backup:
+            st.markdown("**Manual backup is still available if you prefer JSON files.**")
+            
+            col_exp, col_imp = st.columns(2)
+            
+            with col_exp:
+                st.markdown("**📥 Export Data**")
+                
+                # Combine all data for export
+                export_data = {
+                    "results_history": st.session_state.results_history,
+                    "parlay_history": st.session_state.parlay_history,
+                    "exported_at": datetime.now(EST).isoformat(),
+                    "version": "7.3"
+                }
+                
+                if st.session_state.results_history or st.session_state.parlay_history:
+                    json_str = json.dumps(export_data, indent=2)
+                    st.download_button(
+                        label="⬇️ Download Backup",
+                        data=json_str,
+                        file_name=f"nhl_sog_backup_{get_est_date()}.json",
+                        mime="application/json"
+                    )
+                    st.caption(f"{len(st.session_state.results_history)} days of picks, {len(st.session_state.parlay_history)} parlays")
+                else:
+                    st.info("No data to export yet")
+            
+            with col_imp:
+                st.markdown("**📤 Import Data**")
+                
+                uploaded_file = st.file_uploader("Upload backup JSON", type=["json"], key="backup_upload")
+                
+                if uploaded_file is not None:
+                    try:
+                        imported = json.load(uploaded_file)
+                        
+                        # Preview
+                        results_count = len(imported.get("results_history", {}))
+                        parlay_count = len(imported.get("parlay_history", {}))
+                        st.caption(f"Found: {results_count} days, {parlay_count} parlays")
+                        
+                        if st.button("✅ Restore This Backup", type="primary"):
+                            # Merge with existing (don't overwrite)
+                            for date, picks in imported.get("results_history", {}).items():
+                                if date not in st.session_state.results_history:
+                                    st.session_state.results_history[date] = picks
+                            
+                            for date, parlay in imported.get("parlay_history", {}).items():
+                                if date not in st.session_state.parlay_history:
+                                    st.session_state.parlay_history[date] = parlay
+                            
+                            # Save to files (and Google Sheets if connected)
+                            save_history(st.session_state.results_history)
+                            save_parlay_history(st.session_state.parlay_history)
+                            
+                            st.success(f"✅ Restored! Now have {len(st.session_state.results_history)} days of data")
+                            st.rerun()
+                            
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+    
+    st.markdown("---")
+    
+    # ================================================================
+    # BULK BACKFILL SECTION
+    # ================================================================
+    with st.expander("📅 Bulk Backfill (Build History Fast)", expanded=False):
+        st.markdown("""
+        **How to build historical data:**
+        1. Select a past date in sidebar
+        2. Click "Run Analysis" to analyze that day's slate
+        3. Click "Fetch Results" to get actual SOG
+        4. Repeat for each day you want to track
+        
+        **Or use bulk mode below:**
+        """)
+        
+        col_start, col_end = st.columns(2)
+        with col_start:
+            bulk_start = st.date_input("Start Date", value=datetime.now(EST).date() - timedelta(days=7), key="bulk_start")
+        with col_end:
+            bulk_end = st.date_input("End Date", value=datetime.now(EST).date() - timedelta(days=1), key="bulk_end")
+        
+        if st.button("🚀 Bulk Fetch Results", help="Fetches results for dates that already have saved picks"):
+            if bulk_start > bulk_end:
+                st.error("Start date must be before end date")
+            else:
+                dates_to_check = []
+                current = bulk_start
+                while current <= bulk_end:
+                    date_str = current.strftime("%Y-%m-%d")
+                    if date_str in st.session_state.saved_picks:
+                        dates_to_check.append(date_str)
+                    current += timedelta(days=1)
+                
+                if not dates_to_check:
+                    st.warning("No saved picks found for this date range. Run analysis for each date first.")
+                else:
+                    progress = st.progress(0)
+                    status = st.empty()
+                    
+                    for i, date_str in enumerate(dates_to_check):
+                        progress.progress((i + 1) / len(dates_to_check), f"Fetching {date_str}...")
+                        fetch_results(date_str, threshold, status)
+                        time.sleep(0.5)  # Rate limiting
+                    
+                    progress.empty()
+                    st.success(f"✅ Fetched results for {len(dates_to_check)} days!")
+                    st.rerun()
+    
+    st.markdown("---")
     
     col1, col2 = st.columns([2, 1])
     
@@ -1564,6 +1931,41 @@ def display_results_tracker(threshold: int):
     if check_date_str in st.session_state.results_history:
         picks = st.session_state.results_history[check_date_str]
         picks_with_results = [p for p in picks if "actual_sog" in p]
+        
+        # ================================================================
+        # PARLAY RESULTS FOR SELECTED DATE
+        # ================================================================
+        if check_date_str in st.session_state.parlay_history:
+            parlay = st.session_state.parlay_history[check_date_str]
+            result = parlay.get("result")
+            legs_hit = parlay.get("legs_hit")
+            num_legs = parlay.get("num_legs", len(parlay.get("legs", [])))
+            
+            if result:
+                if result == "WIN":
+                    st.success(f"🎉 **Recommended Parlay: WIN** ({legs_hit}/{num_legs} legs)")
+                else:
+                    st.error(f"❌ **Recommended Parlay: LOSS** ({legs_hit}/{num_legs} legs)")
+                
+                # Show leg details
+                leg_data = []
+                for leg in parlay.get("legs", []):
+                    actual = leg.get("actual_sog", "?")
+                    hit = leg.get("hit", None)
+                    result_icon = "✅" if hit == 1 else "❌" if hit == 0 else "⏳"
+                    leg_data.append({
+                        "Result": result_icon,
+                        "Player": leg.get("player_name", "Unknown"),
+                        "Team": leg.get("team", ""),
+                        "Proj": f"{leg.get('projection', 0):.1f}",
+                        "Actual": actual,
+                        "Score": leg.get("score", 0),
+                    })
+                st.dataframe(pd.DataFrame(leg_data), use_container_width=True, hide_index=True)
+            else:
+                st.info(f"⏳ **Recommended Parlay**: {num_legs} legs - Results pending")
+        
+        st.markdown("---")
         
         if picks_with_results:
             hits = sum(1 for p in picks_with_results if p.get("hit", 0) == 1)
@@ -1603,6 +2005,7 @@ def display_results_tracker(threshold: int):
                     "Team": p["team"],
                     "vs": p["opponent"],
                     "Score": p["parlay_score"],
+                    "Prob%": f"{p.get('model_prob', 0):.0f}%",
                     "Tier": p["tier"],
                     "Actual SOG": p.get("actual_sog", "?"),
                     "Threshold": threshold,
@@ -1613,7 +2016,58 @@ def display_results_tracker(threshold: int):
     st.markdown("---")
     st.subheader("📊 Historical Performance")
     
+    # ================================================================
+    # PARLAY RECORD
+    # ================================================================
+    if st.session_state.parlay_history:
+        parlays_with_results = [p for p in st.session_state.parlay_history.values() if p.get("result")]
+        
+        if parlays_with_results:
+            wins = sum(1 for p in parlays_with_results if p["result"] == "WIN")
+            losses = len(parlays_with_results) - wins
+            win_pct = wins / len(parlays_with_results) * 100 if parlays_with_results else 0
+            
+            # Calculate average probability of parlays
+            avg_prob = sum(p.get("probability", 0) for p in parlays_with_results) / len(parlays_with_results) * 100
+            
+            st.markdown("### 🎰 Recommended Parlay Record")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Record", f"{wins}-{losses}")
+            col2.metric("Win Rate", f"{win_pct:.1f}%")
+            col3.metric("Avg Pred %", f"{avg_prob:.1f}%")
+            
+            # Calibration check
+            diff = win_pct - avg_prob
+            if abs(diff) < 5:
+                col4.metric("Calibration", f"{diff:+.1f}%", "Good ✓", delta_color="off")
+            elif diff > 0:
+                col4.metric("Calibration", f"{diff:+.1f}%", "Under-confident 💰", delta_color="normal")
+            else:
+                col4.metric("Calibration", f"{diff:+.1f}%", "Over-confident", delta_color="inverse")
+            
+            # Detailed parlay history
+            with st.expander("📜 Parlay History", expanded=False):
+                parlay_rows = []
+                for date, p in sorted(st.session_state.parlay_history.items(), reverse=True):
+                    if p.get("result"):
+                        legs_str = " + ".join([leg.get("player_name", "?").split()[-1] for leg in p.get("legs", [])])
+                        parlay_rows.append({
+                            "Date": date,
+                            "Result": "✅ WIN" if p["result"] == "WIN" else "❌ LOSS",
+                            "Legs": p.get("num_legs", "?"),
+                            "Hit": f"{p.get('legs_hit', '?')}/{p.get('num_legs', '?')}",
+                            "Pred%": f"{p.get('probability', 0)*100:.0f}%",
+                            "Players": legs_str[:40] + "..." if len(legs_str) > 40 else legs_str,
+                        })
+                
+                if parlay_rows:
+                    st.dataframe(pd.DataFrame(parlay_rows), use_container_width=True, hide_index=True)
+            
+            st.markdown("---")
+    
     if st.session_state.results_history:
+        st.markdown("### 🎯 Individual Picks Performance")
+        
         all_picks = []
         for date, picks in st.session_state.results_history.items():
             for p in picks:
@@ -1654,6 +2108,162 @@ def display_results_tracker(threshold: int):
             
             if summary_data:
                 st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
+            
+            # ================================================================
+            # CALIBRATION TRACKER (V7.3)
+            # ================================================================
+            st.markdown("---")
+            st.subheader("🎯 Model Calibration")
+            st.caption("Comparing predicted probabilities vs actual hit rates")
+            
+            # Group picks by probability bucket
+            prob_buckets = {
+                "90-100%": {"pred_sum": 0, "hits": 0, "total": 0, "pred_min": 90, "pred_max": 100},
+                "80-89%": {"pred_sum": 0, "hits": 0, "total": 0, "pred_min": 80, "pred_max": 89},
+                "70-79%": {"pred_sum": 0, "hits": 0, "total": 0, "pred_min": 70, "pred_max": 79},
+                "60-69%": {"pred_sum": 0, "hits": 0, "total": 0, "pred_min": 60, "pred_max": 69},
+                "50-59%": {"pred_sum": 0, "hits": 0, "total": 0, "pred_min": 50, "pred_max": 59},
+                "<50%": {"pred_sum": 0, "hits": 0, "total": 0, "pred_min": 0, "pred_max": 49},
+            }
+            
+            for p in all_picks:
+                prob = p.get("model_prob", 0)
+                hit = p.get("hit", 0)
+                
+                for bucket_name, bucket in prob_buckets.items():
+                    if bucket["pred_min"] <= prob <= bucket["pred_max"]:
+                        bucket["pred_sum"] += prob
+                        bucket["hits"] += hit
+                        bucket["total"] += 1
+                        break
+            
+            # Build calibration table
+            cal_data = []
+            total_calibration_error = 0
+            total_weighted = 0
+            
+            for bucket_name in ["90-100%", "80-89%", "70-79%", "60-69%", "50-59%", "<50%"]:
+                bucket = prob_buckets[bucket_name]
+                if bucket["total"] > 0:
+                    avg_pred = bucket["pred_sum"] / bucket["total"]
+                    actual_rate = bucket["hits"] / bucket["total"] * 100
+                    diff = actual_rate - avg_pred
+                    
+                    # Weighted calibration error
+                    total_calibration_error += abs(diff) * bucket["total"]
+                    total_weighted += bucket["total"]
+                    
+                    # Determine if model is over/under confident
+                    if abs(diff) < 5:
+                        status = "✅ Good"
+                    elif diff > 0:
+                        status = "📈 Under-confident"  # Actual > Predicted (good for betting!)
+                    else:
+                        status = "📉 Over-confident"  # Actual < Predicted (bad!)
+                    
+                    cal_data.append({
+                        "Bucket": bucket_name,
+                        "Picks": bucket["total"],
+                        "Avg Pred%": f"{avg_pred:.1f}%",
+                        "Actual%": f"{actual_rate:.1f}%",
+                        "Diff": f"{diff:+.1f}%",
+                        "Status": status,
+                    })
+            
+            if cal_data:
+                st.dataframe(pd.DataFrame(cal_data), use_container_width=True, hide_index=True)
+                
+                # Overall calibration metrics
+                if total_weighted > 0:
+                    mae = total_calibration_error / total_weighted
+                    
+                    col1, col2, col3 = st.columns(3)
+                    
+                    # Mean Absolute Error
+                    if mae < 5:
+                        col1.metric("Calibration Error", f"{mae:.1f}%", "Excellent", delta_color="off")
+                    elif mae < 10:
+                        col1.metric("Calibration Error", f"{mae:.1f}%", "Good", delta_color="off")
+                    else:
+                        col1.metric("Calibration Error", f"{mae:.1f}%", "Needs work", delta_color="inverse")
+                    
+                    # Check if model is systematically biased
+                    over_confident_buckets = sum(1 for row in cal_data if "Over-confident" in row["Status"])
+                    under_confident_buckets = sum(1 for row in cal_data if "Under-confident" in row["Status"])
+                    
+                    if over_confident_buckets > under_confident_buckets:
+                        col2.metric("Model Bias", "Over-confident", "Predictions too high")
+                    elif under_confident_buckets > over_confident_buckets:
+                        col2.metric("Model Bias", "Under-confident", "Good for betting! 💰")
+                    else:
+                        col2.metric("Model Bias", "Balanced", "No systematic bias")
+                    
+                    col3.metric("Sample Size", total_weighted, f"{len(st.session_state.results_history)} days")
+                
+                # Interpretation guide
+                with st.expander("📖 How to Read This"):
+                    st.markdown("""
+                    **Calibration** measures if predicted probabilities match actual outcomes.
+                    
+                    | Status | Meaning | Action |
+                    |--------|---------|--------|
+                    | ✅ Good | Pred ≈ Actual (within 5%) | Model is accurate |
+                    | 📈 Under-confident | Actual > Predicted | Great for betting! You're getting value |
+                    | 📉 Over-confident | Actual < Predicted | Reduce bet sizes or adjust model |
+                    
+                    **Calibration Error** = Average absolute difference between predicted and actual.
+                    - <5% = Excellent
+                    - 5-10% = Good
+                    - >10% = Model needs adjustment
+                    
+                    **Ideal scenario:** Slightly under-confident (actual rates beat predictions).
+                    
+                    **Sample size matters:** Need 50+ picks per bucket for reliable calibration.
+                    """)
+                
+                # Projection Accuracy Section
+                st.markdown("---")
+                st.subheader("📐 Projection Accuracy")
+                st.caption("How close are SOG projections to actual results?")
+                
+                # Calculate projection accuracy for picks that have projection data
+                proj_picks = [p for p in all_picks if p.get("projection", 0) > 0 and "actual_sog" in p]
+                
+                if len(proj_picks) >= 10:
+                    proj_errors = []
+                    for p in proj_picks:
+                        proj = p.get("projection", 0)
+                        actual = p.get("actual_sog", 0)
+                        error = actual - proj
+                        proj_errors.append({
+                            "projection": proj,
+                            "actual": actual,
+                            "error": error,
+                            "abs_error": abs(error),
+                        })
+                    
+                    avg_proj = sum(e["projection"] for e in proj_errors) / len(proj_errors)
+                    avg_actual = sum(e["actual"] for e in proj_errors) / len(proj_errors)
+                    mae_proj = sum(e["abs_error"] for e in proj_errors) / len(proj_errors)
+                    bias = avg_actual - avg_proj
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.metric("Avg Projection", f"{avg_proj:.2f}")
+                    col2.metric("Avg Actual", f"{avg_actual:.2f}")
+                    col3.metric("Projection MAE", f"{mae_proj:.2f} SOG")
+                    
+                    if bias > 0.2:
+                        col4.metric("Bias", f"+{bias:.2f}", "Under-projecting")
+                    elif bias < -0.2:
+                        col4.metric("Bias", f"{bias:.2f}", "Over-projecting")
+                    else:
+                        col4.metric("Bias", f"{bias:+.2f}", "Balanced ✓")
+                    
+                    st.caption(f"Based on {len(proj_picks)} picks with projection data")
+                else:
+                    st.info("Need 10+ picks with projection data for accuracy analysis.")
+            else:
+                st.info("Not enough data for calibration analysis yet.")
     else:
         st.info("No historical data yet. Run analysis and fetch results to start tracking.")
 
@@ -1662,8 +2272,7 @@ def display_results_tracker(threshold: int):
 # ============================================================================
 def main():
     st.title("🏒 NHL SOG Analyzer V7.3")
-    st.caption("Hit Rate is King | Variance NOT penalized")
-    st.caption("Professional Grade: Continuous Scoring • Dynamic Weighting • Correlation Penalties")
+    st.caption("Statistical Model: Negative Binomial/Poisson Probability | Calibration Tracking")
     
     # Sidebar
     with st.sidebar:
