@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer v4.0
+NHL Shots on Goal Analyzer v4.1
 ===============================
-- SAFE%: % of games with threshold+1 shots (buffer for stat corrections)
-- DEFENSE: 20 games, proper A-F grading, trend detection
-- AUTO-TRACK: Picks auto-saved, one-click results check
-- DEBUG: Player ID string conversion, extensive matching debug
-- LEGEND: Tags/symbols reference with Safe% explanation
-- NO ODDS API: Uses model + hit rate only
+Changes from v4.0:
+- SAFE%: Informational column (not in scoring) showing buffer games
+- STRICT GRADES: A+/A require 80%+ hit rate - no exceptions
+- FIXED RESULTS: Multiple API paths tried, better debug output
+- TIGHTER SCORING: Lower bonuses, Elite is harder to achieve
+- QUALIFIED: 75%+ hit rate threshold
+
+Grade Requirements:
+- A+ (88+ score, 80%+ hit rate)
+- A  (80-87 score, 80%+ hit rate)
+- B+ (70-79 score, any hit rate) - MAX for <80% players
+- B  (60-69 score)
+- C  (50-59 score)
+- D  (<50 score)
 """
 
 import streamlit as st
@@ -127,7 +135,8 @@ def get_tags(player: Dict) -> str:
     return " ".join(tags)
 
 def get_status_icon(hit_rate: float, is_cold: bool) -> Tuple[bool, str]:
-    if hit_rate >= 85 and not is_cold: return True, "✅"
+    """Qualified = 75%+ hit rate and not cold."""
+    if hit_rate >= 75 and not is_cold: return True, "✅"
     return False, "⚠️"
 
 def format_parlay_text(legs: List[Dict], threshold: int, name: str, prob: float, odds: int) -> str:
@@ -141,18 +150,31 @@ def format_parlay_text(legs: List[Dict], threshold: int, name: str, prob: float,
     return text
 
 def get_score_color(score: int) -> str:
-    if score >= 85: return "🟢"
-    if score >= 75: return "🔵"
-    if score >= 65: return "🟡"
-    if score >= 55: return "🟠"
+    if score >= 88: return "🟢"
+    if score >= 80: return "🔵"
+    if score >= 70: return "🟡"
+    if score >= 60: return "🟠"
     return "🔴"
 
-def get_grade_from_score(score: int) -> str:
-    if score >= 85: return "A+"
-    if score >= 75: return "A"
-    if score >= 65: return "B+"
-    if score >= 55: return "B"
-    if score >= 45: return "C"
+def get_grade_from_score(score: int, hit_rate: float = 0) -> str:
+    """
+    Grade based on score AND hit rate.
+    Elite grades (A+/A) REQUIRE high hit rate - no exceptions.
+    """
+    # Hard requirement: A+/A need 80%+ hit rate
+    if hit_rate < 80:
+        # Cap at B+ regardless of score
+        if score >= 70: return "B+"
+        if score >= 60: return "B"
+        if score >= 50: return "C"
+        return "D"
+    
+    # For qualified players (80%+ hit rate), use score thresholds
+    if score >= 88: return "A+"
+    if score >= 80: return "A"
+    if score >= 70: return "B+"
+    if score >= 60: return "B"
+    if score >= 50: return "C"
     return "D"
 
 # ============================================================================
@@ -162,84 +184,64 @@ def calculate_parlay_score(player: Dict, opp_def: Dict, is_home: bool, threshold
     """
     Calculate a 0-100 parlay score based on reliability factors.
     
-    Factors (research-backed):
-    - Consistency (safe clear rate) = most important for parlays
-    - Floor (never busts) = critical safety
-    - Hit rate = historical success
-    - Volume = more room for error
-    - PP1 = guaranteed extra opportunities
-    - Matchup = opponent defense quality
-    - Trend = current form
+    Key principle: Only QUALIFIED players (75%+ hit rate) should be elite.
+    Safe% is informational only - not heavily weighted.
     """
     score = 50  # Base score
     
     hit_rate = player[f"hit_rate_{threshold}plus"]
     
-    # Hit rate bonus (up to 25 points) - most important
+    # Hit rate is PRIMARY factor (up to 25 points)
+    # This ensures only high hit rate players can be elite
     if hit_rate >= 95: score += 25
     elif hit_rate >= 90: score += 20
     elif hit_rate >= 85: score += 15
     elif hit_rate >= 80: score += 10
     elif hit_rate >= 75: score += 5
-    
-    # Safe clear bonus (threshold + 1 shots = buffer against stat corrections)
-    # For O1.5: 3+ is safe, For O2.5: 4+ is safe, For O3.5: 5+ is safe
-    if threshold == 2:
-        safe_clear = player.get("hit_rate_3plus", 0)
-    elif threshold == 3:
-        safe_clear = player.get("hit_rate_4plus", 0)
-    else:  # threshold == 4
-        safe_clear = player.get("hit_rate_5plus", 0)
-    
-    # Higher safe clear = better (safely clears with buffer)
-    if safe_clear >= 70: score += 10    # Excellent - usually clears by 2+
-    elif safe_clear >= 60: score += 7   # Good buffer
-    elif safe_clear >= 50: score += 5   # Decent buffer
-    elif safe_clear >= 40: score += 2   # Some buffer
-    # < 40% = no bonus (thin margins)
+    elif hit_rate < 70: score -= 10  # Penalty for low hit rate
     
     # Floor bonus (up to 10 points)
     # Floor >= 1 means player NEVER gets shutout
     if player["floor"] >= 2: score += 10
-    elif player["floor"] >= 1: score += 7
+    elif player["floor"] >= 1: score += 5
     
-    # Volume bonus - high average (up to 10 points)
+    # Volume bonus - high average (up to 8 points)
     # Higher volume = more margin for error
     avg = player["avg_sog"]
-    if avg >= 4.0: score += 10
-    elif avg >= 3.5: score += 8
-    elif avg >= 3.0: score += 5
-    elif avg >= 2.5: score += 3
+    if avg >= 4.0: score += 8
+    elif avg >= 3.5: score += 6
+    elif avg >= 3.0: score += 4
+    elif avg >= 2.5: score += 2
     
-    # PP1 bonus (8 points)
+    # PP1 bonus (6 points)
     # Power play = guaranteed extra shot opportunities
-    if player.get("is_pp1"): score += 8
+    if player.get("is_pp1"): score += 6
     
-    # Matchup bonus (up to 10 points)
-    # A+/A = soft defense (allows lots of shots) = good for shooters
-    # D/F = tough defense = bad for shooters
+    # Matchup bonus (up to 8 points)
     opp_grade = opp_def.get("grade", "C")
-    if opp_grade == "A+": score += 10
-    elif opp_grade == "A": score += 7
-    elif opp_grade == "B": score += 4
-    elif opp_grade == "C": score += 0  # Average, no bonus
-    elif opp_grade == "D": score -= 5
-    elif opp_grade == "F": score -= 8
+    if opp_grade == "A+": score += 8
+    elif opp_grade == "A": score += 5
+    elif opp_grade == "B": score += 2
+    elif opp_grade == "D": score -= 3
+    elif opp_grade == "F": score -= 6
     
-    # Defense trend bonus/penalty
+    # Defense trend bonus/penalty (smaller impact)
     opp_trend = opp_def.get("trend", "stable")
-    if opp_trend == "loosening": score += 4  # Defense getting worse = good
-    elif opp_trend == "tightening": score -= 4  # Defense improving = bad
+    if opp_trend == "loosening": score += 3
+    elif opp_trend == "tightening": score -= 3
     
     # Trend bonus/penalty
-    if is_hot: score += 5
-    elif is_cold: score -= 8
+    if is_hot: score += 4
+    elif is_cold: score -= 6
     
     # Home bonus (small)
     if is_home: score += 2
     
     # B2B penalty
-    if player.get("is_b2b"): score -= 3
+    if player.get("is_b2b"): score -= 4
+    
+    # Safe% is NOT in scoring - it's informational only
+    # (shown in UI but doesn't affect parlay score)
     
     return max(0, min(100, score))
 
@@ -572,7 +574,7 @@ def generate_sgp_for_game(plays: List[Dict], game_id: str, threshold: int, min_l
 # UI COMPONENTS
 # ============================================================================
 def show_model_explanation():
-    with st.expander("📖 Parlay Score Explained", expanded=False):
+    with st.expander("📖 Parlay Score & Grades Explained", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("""
@@ -580,51 +582,50 @@ def show_model_explanation():
             
             | Factor | Max Points |
             |--------|------------|
-            | Hit Rate (95%+) | +25 |
-            | Low Bust Rate (<5%) | +10 |
+            | Hit Rate 95%+ | +25 |
+            | Hit Rate 90%+ | +20 |
+            | Hit Rate 85%+ | +15 |
             | Floor ≥ 2 | +10 |
-            | Volume (4+ avg) | +10 |
-            | Soft Matchup (A+) | +10 |
-            | PP1 Player | +8 |
-            | 🔥 Hot Trend | +5 |
-            | Def Loosening 📈 | +4 |
+            | Volume (4+ avg) | +8 |
+            | Soft Matchup (A+) | +8 |
+            | PP1 Player | +6 |
+            | 🔥 Hot Trend | +4 |
+            | Def Loosening 📈 | +3 |
             | Home | +2 |
             
-            ### Bust Rate (% games 0-1 SOG)
-            | Bust% | Points | Risk |
-            |-------|--------|------|
-            | <5% | +10 | Elite |
-            | 5-8% | +5 | Good |
-            | 8-12% | 0 | Avg |
-            | 12-18% | -5 | Risky |
-            | >18% | -10 | Danger |
+            ### Penalties
+            | Factor | Points |
+            |--------|--------|
+            | Hit Rate < 70% | -10 |
+            | ❄️ Cold Trend | -6 |
+            | Tough Matchup (F) | -6 |
+            | Back-to-Back | -4 |
+            | Def Tightening 📉 | -3 |
             """)
         with col2:
             st.markdown("""
-            ### Penalties
+            ### Grade Requirements
             
-            | Factor | Points |
-            |--------|--------|
-            | High Bust Rate (>18%) | -10 |
-            | ❄️ Cold Trend | -8 |
-            | Tough Matchup (F) | -8 |
-            | Tough Matchup (D) | -5 |
-            | Def Tightening 📉 | -4 |
-            | Back-to-Back | -3 |
+            **Elite grades require 80%+ hit rate!**
             
-            ### Defense Grades (SA/G)
-            | Grade | SA/G | Meaning |
-            |-------|------|---------|
-            | A+ | 34+ | Very easy |
-            | A | 32-34 | Easy |
-            | B | 30-32 | Above avg |
-            | C | 28-30 | Average |
-            | D | 26-28 | Tough |
-            | F | <26 | Very tough |
+            | Grade | Score | Hit Rate |
+            |-------|-------|----------|
+            | A+ | 88+ | 80%+ req |
+            | A | 80-87 | 80%+ req |
+            | B+ | 70-79 | Any |
+            | B | 60-69 | Any |
+            | C | 50-59 | Any |
+            | D | <50 | Any |
             
-            ### Defense Trend
-            - 📈 = Loosening (allowing more)
-            - 📉 = Tightening (allowing fewer)
+            *Players with <80% hit rate are capped at B+*
+            
+            ### What This Means
+            - ✅ = Qualified (75%+ hit rate)
+            - 🟢 A+ = Elite parlay leg
+            - 🔵 A = Very reliable
+            - 🟡 B+ = Good option
+            - 🟠 B = Average
+            - 🔴 C/D = Avoid
             """)
 
 # ============================================================================
@@ -632,7 +633,7 @@ def show_model_explanation():
 # ============================================================================
 def main():
     st.title("🏒 NHL SOG Analyzer")
-    st.caption("v4.0 | Bust Rate + Auto-Track + Debug")
+    st.caption("v4.1 | Safe% + Strict Elite Grades + Fixed Results")
     
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -779,7 +780,7 @@ def run_fast_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[D
             is_qualified, status_icon = get_status_icon(hit_rate, is_cold)
             
             parlay_score = calculate_parlay_score(stats, opp_def, is_home, threshold, is_hot, is_cold)
-            parlay_grade = get_grade_from_score(parlay_score)
+            parlay_grade = get_grade_from_score(parlay_score, hit_rate)
             
             play = {
                 "player": stats,
@@ -1233,6 +1234,7 @@ def check_and_update_results(check_date: str, threshold: int):
     games_finished = 0
     game_states = []
     boxscore_players = []  # Debug: track players found in boxscores
+    api_structure_debug = []  # Debug: show API structure
     
     for game in games:
         try:
@@ -1255,44 +1257,104 @@ def check_and_update_results(check_date: str, threshold: int):
             
             games_finished += 1
             
-            # Get player stats
-            for team_key in ["homeTeam", "awayTeam"]:
-                for player_type in ["forwards", "defense"]:
-                    players = box_data.get("boxscore", {}).get("playerByGameStats", {}).get(team_key, {}).get(player_type, [])
-                    
-                    for player in players:
-                        pid = player.get("playerId")
-                        pid_str = str(pid) if pid else ""
-                        
-                        # Get player name from boxscore
-                        name_data = player.get("name", {})
-                        if isinstance(name_data, dict):
-                            player_name = name_data.get("default", "")
-                        else:
-                            player_name = str(name_data)
-                        
-                        actual_sog = player.get("sog", 0)
-                        
-                        # Track for debug
-                        boxscore_players.append(f"ID:{pid} Name:'{player_name}' SOG:{actual_sog}")
-                        
-                        # Try to match by ID first (as string)
-                        matched_pick = None
-                        match_method = ""
-                        
-                        if pid_str and pid_str in pick_by_id:
-                            matched_pick = pick_by_id[pid_str]
-                            match_method = "ID"
-                        # Fallback to name matching
-                        elif player_name and player_name.lower().strip() in pick_by_name:
-                            matched_pick = pick_by_name[player_name.lower().strip()]
-                            match_method = "name"
-                        
-                        if matched_pick:
-                            matched_pick["actual_sog"] = actual_sog
-                            matched_pick["hit"] = 1 if actual_sog >= threshold else 0
-                            results_found += 1
-                            debug_info.append(f"✅ Matched ({match_method}): {player_name} = {actual_sog} SOG")
+            # Debug: Show top-level keys for first finished game
+            if len(api_structure_debug) == 0:
+                api_structure_debug.append(f"Top keys: {list(box_data.keys())}")
+                if "boxscore" in box_data:
+                    api_structure_debug.append(f"boxscore keys: {list(box_data['boxscore'].keys())}")
+                if "playerByGameStats" in box_data:
+                    api_structure_debug.append(f"playerByGameStats keys: {list(box_data['playerByGameStats'].keys())}")
+            
+            # Try multiple possible paths for player stats
+            player_locations = []
+            
+            # Path 1: boxscore.playerByGameStats.{team}.forwards/defense
+            if "boxscore" in box_data and "playerByGameStats" in box_data.get("boxscore", {}):
+                pbgs = box_data["boxscore"]["playerByGameStats"]
+                for team_key in ["homeTeam", "awayTeam"]:
+                    if team_key in pbgs:
+                        for pos in ["forwards", "defense"]:
+                            if pos in pbgs[team_key]:
+                                player_locations.extend(pbgs[team_key][pos])
+            
+            # Path 2: playerByGameStats directly at root
+            if "playerByGameStats" in box_data:
+                pbgs = box_data["playerByGameStats"]
+                for team_key in ["homeTeam", "awayTeam"]:
+                    if team_key in pbgs:
+                        for pos in ["forwards", "defense"]:
+                            if pos in pbgs[team_key]:
+                                player_locations.extend(pbgs[team_key][pos])
+            
+            # Path 3: boxscore.teams.{home/away}.players (older format)
+            if "boxscore" in box_data and "teams" in box_data.get("boxscore", {}):
+                teams = box_data["boxscore"]["teams"]
+                for team_key in ["home", "away"]:
+                    if team_key in teams and "players" in teams[team_key]:
+                        player_locations.extend(teams[team_key]["players"])
+            
+            # Path 4: Try to find any list of players with SOG data
+            if not player_locations and "boxscore" in box_data:
+                boxscore = box_data["boxscore"]
+                # Recursively look for player arrays
+                def find_players(obj, path=""):
+                    found = []
+                    if isinstance(obj, list):
+                        for item in obj:
+                            if isinstance(item, dict) and ("playerId" in item or "sog" in item):
+                                found.append(item)
+                    elif isinstance(obj, dict):
+                        for k, v in obj.items():
+                            found.extend(find_players(v, f"{path}.{k}"))
+                    return found
+                player_locations = find_players(boxscore)
+            
+            if len(api_structure_debug) < 3:
+                api_structure_debug.append(f"Found {len(player_locations)} players in boxscore")
+            
+            # Process found players
+            for player in player_locations:
+                pid = player.get("playerId") or player.get("id")
+                pid_str = str(pid) if pid else ""
+                
+                # Get player name - handle different formats
+                name_data = player.get("name", {})
+                if isinstance(name_data, dict):
+                    player_name = name_data.get("default", "") or f"{name_data.get('first', '')} {name_data.get('last', '')}".strip()
+                else:
+                    player_name = str(name_data) if name_data else ""
+                
+                # Also try firstName/lastName
+                if not player_name:
+                    first = player.get("firstName", {})
+                    last = player.get("lastName", {})
+                    if isinstance(first, dict): first = first.get("default", "")
+                    if isinstance(last, dict): last = last.get("default", "")
+                    player_name = f"{first} {last}".strip()
+                
+                actual_sog = player.get("sog", 0) or player.get("shots", 0) or 0
+                
+                # Track for debug
+                if pid or player_name:
+                    boxscore_players.append(f"ID:{pid} Name:'{player_name}' SOG:{actual_sog}")
+                
+                # Try to match by ID first (as string)
+                matched_pick = None
+                match_method = ""
+                
+                if pid_str and pid_str in pick_by_id:
+                    matched_pick = pick_by_id[pid_str]
+                    match_method = "ID"
+                # Fallback to name matching
+                elif player_name and player_name.lower().strip() in pick_by_name:
+                    matched_pick = pick_by_name[player_name.lower().strip()]
+                    match_method = "name"
+                
+                if matched_pick:
+                    matched_pick["actual_sog"] = actual_sog
+                    matched_pick["hit"] = 1 if actual_sog >= threshold else 0
+                    results_found += 1
+                    debug_info.append(f"✅ Matched ({match_method}): {player_name} = {actual_sog} SOG")
             
             time.sleep(0.05)
             
@@ -1311,6 +1373,10 @@ def check_and_update_results(check_date: str, threshold: int):
     # Show debug info
     with st.expander("🐛 Debug: Matching Details"):
         st.text("\n".join(debug_info))
+        st.markdown("---")
+        st.text("API Structure:")
+        for line in api_structure_debug:
+            st.text(f"  {line}")
         st.markdown("---")
         st.text(f"Boxscore players found (first 20 of {len(boxscore_players)}):")
         for bp in boxscore_players[:20]:
@@ -1552,14 +1618,18 @@ def show_help():
     
     ## Grade Meanings
     
-    | Grade | What It Means |
-    |-------|---------------|
-    | **A+** | Lock it in - elite parlay leg |
-    | **A** | Very reliable |
-    | **B+** | Good, minor concerns |
-    | **B** | Average, some risk |
-    | **C** | Below average |
-    | **D** | Risky - avoid in parlays |
+    **IMPORTANT: A+ and A grades REQUIRE 80%+ hit rate**
+    
+    | Grade | Score | Hit Rate Req | What It Means |
+    |-------|-------|--------------|---------------|
+    | **A+** | 88+ | 80%+ | Elite - best parlay leg |
+    | **A** | 80-87 | 80%+ | Very reliable |
+    | **B+** | 70-79 | Any | Good option |
+    | **B** | 60-69 | Any | Average, some risk |
+    | **C** | 50-59 | Any | Below average |
+    | **D** | <50 | Any | Avoid in parlays |
+    
+    *Players with <80% hit rate are capped at B+ max, regardless of score.*
     
     ## Tags
     
