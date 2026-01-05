@@ -39,8 +39,49 @@ st.set_page_config(
     page_title="NHL SOG Analyzer V7.2",
     page_icon="🏒",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="auto"  # Auto-collapses on mobile, expands on desktop
 )
+
+# ============================================================================
+# MOBILE-RESPONSIVE CSS (does not affect desktop)
+# ============================================================================
+st.markdown("""
+<style>
+/* Mobile optimizations - only applies to screens < 768px */
+@media (max-width: 768px) {
+    /* Smaller fonts throughout */
+    .stDataFrame { font-size: 11px !important; }
+    .stDataFrame td, .stDataFrame th { 
+        padding: 4px 6px !important; 
+        font-size: 11px !important;
+    }
+    
+    /* Compact headers */
+    h1 { font-size: 1.4rem !important; }
+    h2 { font-size: 1.2rem !important; }
+    h3 { font-size: 1rem !important; }
+    
+    /* Tighter metrics */
+    [data-testid="stMetricValue"] { font-size: 1.2rem !important; }
+    [data-testid="stMetricLabel"] { font-size: 0.7rem !important; }
+    
+    /* Reduce padding */
+    .block-container { padding: 1rem 0.5rem !important; }
+    
+    /* Make tabs smaller */
+    .stTabs [data-baseweb="tab"] { 
+        font-size: 0.8rem !important; 
+        padding: 8px 12px !important;
+    }
+    
+    /* Sidebar auto-collapse hint */
+    section[data-testid="stSidebar"] { min-width: 0px !important; }
+}
+
+/* Ensure horizontal scroll on tables for all screen sizes */
+.stDataFrame > div { overflow-x: auto !important; }
+</style>
+""", unsafe_allow_html=True)
 
 # ============================================================================
 # CONFIGURATION
@@ -1042,13 +1083,13 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
         game_info[game["away_team"]] = {"opponent": game["home_team"], "home_away": "AWAY", "time": game["time"], "game_id": game["id"]}
         game_info[game["home_team"]] = {"opponent": game["away_team"], "home_away": "HOME", "time": game["time"], "game_id": game["id"]}
     
-    # Fetch defense stats
+    # Fetch defense stats (checks last 20 games per team)
     team_defense = {}
     teams_list = list(teams_playing)
     for i, team in enumerate(teams_list):
         pct = 0.05 + (i / len(teams_list)) * 0.35
         progress_bar.progress(pct)
-        status_text.text(f"🛡️ Fetching {team} defense... ({i+1}/{len(teams_list)})")
+        status_text.text(f"🛡️ {team} defense (L20)... ({i+1}/{len(teams_list)} teams)")
         team_defense[team] = get_team_defense_stats(team)
         time.sleep(0.05)
     
