@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer v4.1
+NHL Shots on Goal Analyzer v4.2
 ===============================
-Changes from v4.0:
-- SAFE%: Informational column (not in scoring) showing buffer games
-- STRICT GRADES: A+/A require 80%+ hit rate - no exceptions
-- FIXED RESULTS: Multiple API paths tried, better debug output
-- TIGHTER SCORING: Lower bonuses, Elite is harder to achieve
-- QUALIFIED: 75%+ hit rate threshold
+Changes from v4.1:
+- REVERTED: Original bust_rate scoring (not safe_clear)
+- Safe% is DISPLAY ONLY (not in calculations)
+- Removed Grade column (Score shows grade via emoji color)
+- Qualified threshold back to 85%+ hit rate
+- Fixed results API paths with multi-path fallback
 
-Grade Requirements:
-- A+ (88+ score, 80%+ hit rate)
-- A  (80-87 score, 80%+ hit rate)
-- B+ (70-79 score, any hit rate) - MAX for <80% players
-- B  (60-69 score)
-- C  (50-59 score)
-- D  (<50 score)
+Score Components:
+- Hit rate 95%+: +25 (90%+=20, 85%+=15, 80%+=10, 75%+=5)
+- Bust rate <5%: +10 (5-8%=+5, 8-12%=0, 12-18%=-5, >18%=-10)
+- Floor ≥2: +10, Floor ≥1: +7
+- Volume 4+: +10, 3.5+: +8, 3+: +5, 2.5+: +3
+- PP1: +8
+- Matchup A+: +10, A: +7, B: +4, D: -5, F: -8
+- Defense trend: loosening +4, tightening -4
+- Hot trend: +5, Cold: -8
+- Home: +2
+- B2B: -3
 """
 
 import streamlit as st
@@ -135,8 +139,8 @@ def get_tags(player: Dict) -> str:
     return " ".join(tags)
 
 def get_status_icon(hit_rate: float, is_cold: bool) -> Tuple[bool, str]:
-    """Qualified = 75%+ hit rate and not cold."""
-    if hit_rate >= 75 and not is_cold: return True, "✅"
+    """Qualified = 85%+ hit rate and not cold."""
+    if hit_rate >= 85 and not is_cold: return True, "✅"
     return False, "⚠️"
 
 def format_parlay_text(legs: List[Dict], threshold: int, name: str, prob: float, odds: int) -> str:
@@ -150,31 +154,19 @@ def format_parlay_text(legs: List[Dict], threshold: int, name: str, prob: float,
     return text
 
 def get_score_color(score: int) -> str:
-    if score >= 88: return "🟢"
-    if score >= 80: return "🔵"
-    if score >= 70: return "🟡"
-    if score >= 60: return "🟠"
+    if score >= 85: return "🟢"
+    if score >= 75: return "🔵"
+    if score >= 65: return "🟡"
+    if score >= 55: return "🟠"
     return "🔴"
 
 def get_grade_from_score(score: int, hit_rate: float = 0) -> str:
-    """
-    Grade based on score AND hit rate.
-    Elite grades (A+/A) REQUIRE high hit rate - no exceptions.
-    """
-    # Hard requirement: A+/A need 80%+ hit rate
-    if hit_rate < 80:
-        # Cap at B+ regardless of score
-        if score >= 70: return "B+"
-        if score >= 60: return "B"
-        if score >= 50: return "C"
-        return "D"
-    
-    # For qualified players (80%+ hit rate), use score thresholds
-    if score >= 88: return "A+"
-    if score >= 80: return "A"
-    if score >= 70: return "B+"
-    if score >= 60: return "B"
-    if score >= 50: return "C"
+    """Grade based on score only."""
+    if score >= 85: return "A+"
+    if score >= 75: return "A"
+    if score >= 65: return "B+"
+    if score >= 55: return "B"
+    if score >= 45: return "C"
     return "D"
 
 # ============================================================================
@@ -183,65 +175,63 @@ def get_grade_from_score(score: int, hit_rate: float = 0) -> str:
 def calculate_parlay_score(player: Dict, opp_def: Dict, is_home: bool, threshold: int, is_hot: bool, is_cold: bool) -> int:
     """
     Calculate a 0-100 parlay score based on reliability factors.
-    
-    Key principle: Only QUALIFIED players (75%+ hit rate) should be elite.
-    Safe% is informational only - not heavily weighted.
+    Original scoring system - Safe% is NOT included (informational only).
     """
     score = 50  # Base score
     
     hit_rate = player[f"hit_rate_{threshold}plus"]
     
-    # Hit rate is PRIMARY factor (up to 25 points)
-    # This ensures only high hit rate players can be elite
+    # Hit rate bonus (up to 25 points) - most important
     if hit_rate >= 95: score += 25
     elif hit_rate >= 90: score += 20
     elif hit_rate >= 85: score += 15
     elif hit_rate >= 80: score += 10
     elif hit_rate >= 75: score += 5
-    elif hit_rate < 70: score -= 10  # Penalty for low hit rate
     
-    # Floor bonus (up to 10 points)
-    # Floor >= 1 means player NEVER gets shutout
+    # Bust rate bonus/penalty (% of games with 0-1 SOG)
+    bust_rate = player.get("bust_rate", 10)
+    if bust_rate < 5: score += 10
+    elif bust_rate < 8: score += 5
+    elif bust_rate < 12: score += 0
+    elif bust_rate < 18: score -= 5
+    else: score -= 10
+    
+    # Floor bonus
     if player["floor"] >= 2: score += 10
-    elif player["floor"] >= 1: score += 5
+    elif player["floor"] >= 1: score += 7
     
-    # Volume bonus - high average (up to 8 points)
-    # Higher volume = more margin for error
+    # Volume bonus
     avg = player["avg_sog"]
-    if avg >= 4.0: score += 8
-    elif avg >= 3.5: score += 6
-    elif avg >= 3.0: score += 4
-    elif avg >= 2.5: score += 2
+    if avg >= 4.0: score += 10
+    elif avg >= 3.5: score += 8
+    elif avg >= 3.0: score += 5
+    elif avg >= 2.5: score += 3
     
-    # PP1 bonus (6 points)
-    # Power play = guaranteed extra shot opportunities
-    if player.get("is_pp1"): score += 6
+    # PP1 bonus
+    if player.get("is_pp1"): score += 8
     
-    # Matchup bonus (up to 8 points)
+    # Matchup bonus
     opp_grade = opp_def.get("grade", "C")
-    if opp_grade == "A+": score += 8
-    elif opp_grade == "A": score += 5
-    elif opp_grade == "B": score += 2
-    elif opp_grade == "D": score -= 3
-    elif opp_grade == "F": score -= 6
+    if opp_grade == "A+": score += 10
+    elif opp_grade == "A": score += 7
+    elif opp_grade == "B": score += 4
+    elif opp_grade == "D": score -= 5
+    elif opp_grade == "F": score -= 8
     
-    # Defense trend bonus/penalty (smaller impact)
+    # Defense trend
     opp_trend = opp_def.get("trend", "stable")
-    if opp_trend == "loosening": score += 3
-    elif opp_trend == "tightening": score -= 3
+    if opp_trend == "loosening": score += 4
+    elif opp_trend == "tightening": score -= 4
     
     # Trend bonus/penalty
-    if is_hot: score += 4
-    elif is_cold: score -= 6
+    if is_hot: score += 5
+    elif is_cold: score -= 8
     
-    # Home bonus (small)
+    # Home bonus
     if is_home: score += 2
     
     # B2B penalty
-    if player.get("is_b2b"): score -= 4
-    
-    # Safe% is NOT in scoring - it's informational only
-    # (shown in UI but doesn't affect parlay score)
+    if player.get("is_b2b"): score -= 3
     
     return max(0, min(100, score))
 
@@ -467,8 +457,11 @@ def fetch_player_stats_fast(player_info: Dict) -> Optional[Dict]:
         home_avg = sum(home_shots) / len(home_shots) if home_shots else avg
         away_avg = sum(away_shots) / len(away_shots) if away_shots else avg
         
-        # Safe clear rates (with 1-shot buffer for stat corrections)
-        # For O1.5: 3+ is safe, For O2.5: 4+ is safe, For O3.5: 5+ is safe
+        # Bust rate = % of games with 0-1 SOG (parlay killers)
+        bust_games = sum(1 for s in all_shots if s <= 1)
+        bust_rate = (bust_games / gp) * 100
+        
+        # Safe clear rates (informational only - not in scoring)
         hit_5 = sum(1 for s in all_shots if s >= 5) / gp * 100
         
         # Estimate PP1 from PP goals and volume
@@ -500,6 +493,7 @@ def fetch_player_stats_fast(player_info: Dict) -> Optional[Dict]:
             "current_streak": streak,
             "home_avg": round(home_avg, 2),
             "away_avg": round(away_avg, 2),
+            "bust_rate": round(bust_rate, 1),
             "is_pp1": is_pp1,
             "is_b2b": is_b2b,
             "pp_goals": pp_goals,
@@ -574,7 +568,7 @@ def generate_sgp_for_game(plays: List[Dict], game_id: str, threshold: int, min_l
 # UI COMPONENTS
 # ============================================================================
 def show_model_explanation():
-    with st.expander("📖 Parlay Score & Grades Explained", expanded=False):
+    with st.expander("📖 Parlay Score Explained", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("""
@@ -582,50 +576,50 @@ def show_model_explanation():
             
             | Factor | Max Points |
             |--------|------------|
-            | Hit Rate 95%+ | +25 |
-            | Hit Rate 90%+ | +20 |
-            | Hit Rate 85%+ | +15 |
+            | Hit Rate (95%+) | +25 |
+            | Low Bust Rate (<5%) | +10 |
             | Floor ≥ 2 | +10 |
-            | Volume (4+ avg) | +8 |
-            | Soft Matchup (A+) | +8 |
-            | PP1 Player | +6 |
-            | 🔥 Hot Trend | +4 |
-            | Def Loosening 📈 | +3 |
+            | Volume (4+ avg) | +10 |
+            | Soft Matchup (A+) | +10 |
+            | PP1 Player | +8 |
+            | 🔥 Hot Trend | +5 |
+            | Def Loosening 📈 | +4 |
             | Home | +2 |
             
-            ### Penalties
-            | Factor | Points |
-            |--------|--------|
-            | Hit Rate < 70% | -10 |
-            | ❄️ Cold Trend | -6 |
-            | Tough Matchup (F) | -6 |
-            | Back-to-Back | -4 |
-            | Def Tightening 📉 | -3 |
+            ### Bust Rate (% games 0-1 SOG)
+            | Bust% | Points | Risk |
+            |-------|--------|------|
+            | <5% | +10 | Elite |
+            | 5-8% | +5 | Good |
+            | 8-12% | 0 | Avg |
+            | 12-18% | -5 | Risky |
+            | >18% | -10 | Danger |
             """)
         with col2:
             st.markdown("""
-            ### Grade Requirements
+            ### Penalties
             
-            **Elite grades require 80%+ hit rate!**
+            | Factor | Points |
+            |--------|--------|
+            | High Bust Rate (>18%) | -10 |
+            | ❄️ Cold Trend | -8 |
+            | Tough Matchup (F) | -8 |
+            | Tough Matchup (D) | -5 |
+            | Def Tightening 📉 | -4 |
+            | Back-to-Back | -3 |
             
-            | Grade | Score | Hit Rate |
-            |-------|-------|----------|
-            | A+ | 88+ | 80%+ req |
-            | A | 80-87 | 80%+ req |
-            | B+ | 70-79 | Any |
-            | B | 60-69 | Any |
-            | C | 50-59 | Any |
-            | D | <50 | Any |
+            ### Defense Grades (SA/G)
+            | Grade | SA/G | Meaning |
+            |-------|------|---------|
+            | A+ | 34+ | Very easy |
+            | A | 32-34 | Easy |
+            | B | 30-32 | Above avg |
+            | C | 28-30 | Average |
+            | D | 26-28 | Tough |
+            | F | <26 | Very tough |
             
-            *Players with <80% hit rate are capped at B+*
-            
-            ### What This Means
-            - ✅ = Qualified (75%+ hit rate)
-            - 🟢 A+ = Elite parlay leg
-            - 🔵 A = Very reliable
-            - 🟡 B+ = Good option
-            - 🟠 B = Average
-            - 🔴 C/D = Avoid
+            ### Safe% (Info Only)
+            Shows % with buffer shot - NOT in score.
             """)
 
 # ============================================================================
@@ -633,7 +627,7 @@ def show_model_explanation():
 # ============================================================================
 def main():
     st.title("🏒 NHL SOG Analyzer")
-    st.caption("v4.1 | Safe% + Strict Elite Grades + Fixed Results")
+    st.caption("v4.2 | Original Scoring + Safe% Info Column")
     
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -839,7 +833,7 @@ def display_all_results(plays: List[Dict], threshold: int, date_str: str):
             **Status Icons**
             | Icon | Meaning |
             |------|---------|
-            | ✅ | Qualified (75%+ hit rate) |
+            | ✅ | Qualified (85%+ hit rate) |
             | ⚠️ | Not qualified / Cold |
             
             **Player Tags**
@@ -922,7 +916,6 @@ def display_all_results(plays: List[Dict], threshold: int, date_str: str):
             "": play["status_icon"],
             "Player": p["name"],
             "Score": f"{score_emoji} {play['parlay_score']}",
-            "Grade": play["parlay_grade"],
             "Tags": play["tags"],
             "Team": p["team"],
             "vs": play["opponent"],
@@ -973,7 +966,6 @@ def show_best_bets(plays: List[Dict], threshold: int):
             elite_data.append({
                 "Player": p["name"],
                 "Score": f"{get_score_color(play['parlay_score'])} {play['parlay_score']}",
-                "Grade": play["parlay_grade"],
                 "Tags": play["tags"],
                 "Team": p["team"],
                 "vs": play["opponent"],
@@ -993,7 +985,7 @@ def show_best_bets(plays: List[Dict], threshold: int):
     st.caption("B+ and B grade")
     
     if good:
-        good_data = [{"Player": p["player"]["name"], "Score": p["parlay_score"], "Grade": p["parlay_grade"],
+        good_data = [{"Player": p["player"]["name"], "Score": p["parlay_score"],
                       "Tags": p["tags"], "vs": p["opponent"], "Model%": f"{p[prob_key]:.1f}%", 
                       "Hit%": f"{p['player'][hit_key]:.0f}%",
                       "Safe%": f"{p['player'].get(safe_key, 0):.0f}%"} for p in good]
@@ -1003,7 +995,7 @@ def show_best_bets(plays: List[Dict], threshold: int):
     
     st.subheader(f"⚠️ Risky ({len(risky)})")
     if risky:
-        risky_data = [{"Player": p["player"]["name"], "Score": p["parlay_score"], "Grade": p["parlay_grade"],
+        risky_data = [{"Player": p["player"]["name"], "Score": p["parlay_score"],
                        "vs": p["opponent"], "Model%": f"{p[prob_key]:.1f}%",
                        "Safe%": f"{p['player'].get(safe_key, 0):.0f}%"} for p in risky]
         st.dataframe(pd.DataFrame(risky_data), use_container_width=True, hide_index=True)
