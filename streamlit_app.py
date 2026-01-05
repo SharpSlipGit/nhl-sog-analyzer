@@ -1168,6 +1168,13 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
         if stats["current_streak"] >= 5: tags.append(f"🔥{stats['current_streak']}G")
         if stats.get("is_b2b"): tags.append("B2B")
         
+        # SOG Projection (adjusted for matchup, venue, PP)
+        base_proj = (stats["last_5_avg"] * 0.4) + (stats["last_10_avg"] * 0.3) + (stats["avg_sog"] * 0.3)
+        opp_factor = opp_def.get("shots_allowed_per_game", 30.0) / LEAGUE_AVG_SAG
+        venue_factor = 1.03 if is_home else 0.97
+        pp_factor = 1.10 if stats.get("is_pp1") else 1.0
+        projection = base_proj * opp_factor * venue_factor * pp_factor
+        
         play = {
             "player": stats,
             "player_id": stats["player_id"],
@@ -1178,6 +1185,7 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
             "game_id": info["game_id"],
             "parlay_score": round(parlay_score, 1),
             "model_prob": round(model_prob, 1),
+            "projection": round(projection, 1),
             "tier": tier,
             "edges": edges,
             "risks": risks,
@@ -1265,6 +1273,7 @@ def display_all_results(plays: List[Dict], threshold: int):
             "Hit%": f"{hit_rate:.0f}%",
             "Cush%": f"{cushion:.0f}%",
             "Shut%": f"{player.get('shutout_rate', 0):.0f}%",
+            "Proj": p.get("projection", 0),
             "Avg": player["avg_sog"],
             "L5": player["last_5_avg"],
             "L10": player.get("last_10_avg", player["avg_sog"]),
@@ -1289,6 +1298,7 @@ def display_all_results(plays: List[Dict], threshold: int):
             "Hit%": st.column_config.TextColumn("Hit%", width="small"),
             "Cush%": st.column_config.TextColumn("Cush%", width="small"),
             "Shut%": st.column_config.TextColumn("Shut%", width="small"),
+            "Proj": st.column_config.NumberColumn("Proj", format="%.1f", width="small", help="Tonight's projected SOG"),
             "Avg": st.column_config.NumberColumn("Avg", format="%.2f", width="small"),
             "L5": st.column_config.NumberColumn("L5", format="%.1f", width="small"),
             "L10": st.column_config.NumberColumn("L10", format="%.1f", width="small"),
@@ -1327,6 +1337,7 @@ def display_all_results(plays: List[Dict], threshold: int):
             "Hit%": f"{hit_rate:.0f}%",
             "Cush%": f"{cushion:.0f}%",
             "Shut%": f"{player.get('shutout_rate', 0):.0f}%",
+            "Proj": p.get("projection", 0),
             "Avg": player["avg_sog"],
             "L5": player["last_5_avg"],
             "L10": player.get("last_10_avg", player["avg_sog"]),
@@ -1360,7 +1371,7 @@ def display_tiered_breakdown(plays: List[Dict], threshold: int):
                 with col1:
                     kill_badge = " 🚫" if p.get("killed") else ""
                     st.markdown(f"**{player['name']}** ({player['team']}) vs {p['opponent']}{kill_badge}")
-                    st.caption(f"Score: {p['parlay_score']:.0f} | Hit: {hit_rate:.0f}% | Prob: {p['model_prob']:.0f}%")
+                    st.caption(f"Score: {p['parlay_score']:.0f} | Hit: {hit_rate:.0f}% | Proj: {p.get('projection', 0):.1f} | Prob: {p['model_prob']:.0f}%")
                 
                 with col2:
                     if p["edges"]:
@@ -1456,7 +1467,7 @@ def display_parlays_v7(plays: List[Dict], threshold: int, unit_size: float):
         st.markdown("**Legs:**")
         for leg in best_parlay["legs"]:
             player = leg["player"]
-            st.markdown(f"- **{player['name']}** ({player['team']}) O{threshold-0.5} SOG | Score: {leg['parlay_score']:.0f} | {leg['tier']}")
+            st.markdown(f"- **{player['name']}** ({player['team']}) O{threshold-0.5} SOG | Proj: {leg.get('projection', 0):.1f} | Score: {leg['parlay_score']:.0f}")
         
         # Copy button
         copy_text = f"🏒 NHL SOG Parlay ({best_parlay['num_legs']}-leg)\n"
