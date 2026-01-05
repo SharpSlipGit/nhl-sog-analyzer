@@ -1756,9 +1756,13 @@ def display_results_tracker(threshold: int):
                 st.success("✅ JSONBin is connected and working!")
                 st.caption("Your data automatically syncs to JSONBin after every analysis and result fetch.")
                 
+                # Count only real data (exclude "init" keys)
+                real_results = sum(1 for v in st.session_state.results_history.values() if isinstance(v, list))
+                real_parlays = sum(1 for v in st.session_state.parlay_history.values() if isinstance(v, dict) and "legs" in v)
+                
                 col1, col2 = st.columns(2)
-                col1.metric("Results History", f"{len(st.session_state.results_history)} days")
-                col2.metric("Parlays Tracked", f"{len(st.session_state.parlay_history)} parlays")
+                col1.metric("Results History", f"{real_results} days")
+                col2.metric("Parlays Tracked", f"{real_parlays} parlays")
             else:
                 st.warning("JSONBin not configured. Using local storage (will be wiped on redeploy).")
                 st.markdown("👉 Go to **JSONBin Setup** tab for instructions.")
