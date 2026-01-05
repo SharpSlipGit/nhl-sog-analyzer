@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer v3.9
+NHL Shots on Goal Analyzer v4.0
 ===============================
-- BUST RATE: % of games with 0-1 SOG (replaces variance)
+- SAFE%: % of games with threshold+1 shots (buffer for stat corrections)
 - DEFENSE: 20 games, proper A-F grading, trend detection
-- RESULTS TRACKER: Auto-save picks, one-click results check
-- LEGEND: Expandable tags/symbols reference
-- DEBUG: Game status details in results checker
+- AUTO-TRACK: Picks auto-saved, one-click results check
+- DEBUG: Player ID string conversion, extensive matching debug
+- LEGEND: Tags/symbols reference with Safe% explanation
 - NO ODDS API: Uses model + hit rate only
 """
 
@@ -163,7 +163,7 @@ def calculate_parlay_score(player: Dict, opp_def: Dict, is_home: bool, threshold
     Calculate a 0-100 parlay score based on reliability factors.
     
     Factors (research-backed):
-    - Consistency (low variance) = most important for parlays
+    - Consistency (safe clear rate) = most important for parlays
     - Floor (never busts) = critical safety
     - Hit rate = historical success
     - Volume = more room for error
@@ -182,14 +182,21 @@ def calculate_parlay_score(player: Dict, opp_def: Dict, is_home: bool, threshold
     elif hit_rate >= 80: score += 10
     elif hit_rate >= 75: score += 5
     
-    # Bust rate bonus/penalty (% of games with 0-1 SOG)
-    # Low bust rate = reliable, high bust rate = parlay killer
-    bust_rate = player.get("bust_rate", 10)
-    if bust_rate < 5: score += 10      # Elite - rarely busts
-    elif bust_rate < 8: score += 5     # Good
-    elif bust_rate < 12: score += 0    # Average
-    elif bust_rate < 18: score -= 5    # Concerning
-    else: score -= 10                   # High risk - often busts
+    # Safe clear bonus (threshold + 1 shots = buffer against stat corrections)
+    # For O1.5: 3+ is safe, For O2.5: 4+ is safe, For O3.5: 5+ is safe
+    if threshold == 2:
+        safe_clear = player.get("hit_rate_3plus", 0)
+    elif threshold == 3:
+        safe_clear = player.get("hit_rate_4plus", 0)
+    else:  # threshold == 4
+        safe_clear = player.get("hit_rate_5plus", 0)
+    
+    # Higher safe clear = better (safely clears with buffer)
+    if safe_clear >= 70: score += 10    # Excellent - usually clears by 2+
+    elif safe_clear >= 60: score += 7   # Good buffer
+    elif safe_clear >= 50: score += 5   # Decent buffer
+    elif safe_clear >= 40: score += 2   # Some buffer
+    # < 40% = no bonus (thin margins)
     
     # Floor bonus (up to 10 points)
     # Floor >= 1 means player NEVER gets shutout
@@ -458,9 +465,9 @@ def fetch_player_stats_fast(player_info: Dict) -> Optional[Dict]:
         home_avg = sum(home_shots) / len(home_shots) if home_shots else avg
         away_avg = sum(away_shots) / len(away_shots) if away_shots else avg
         
-        # Bust rate = % of games with 0-1 SOG (parlay killers)
-        bust_games = sum(1 for s in all_shots if s <= 1)
-        bust_rate = (bust_games / gp) * 100
+        # Safe clear rates (with 1-shot buffer for stat corrections)
+        # For O1.5: 3+ is safe, For O2.5: 4+ is safe, For O3.5: 5+ is safe
+        hit_5 = sum(1 for s in all_shots if s >= 5) / gp * 100
         
         # Estimate PP1 from PP goals and volume
         is_pp1 = (pp_goals >= 3 and avg >= 2.5) or (pp_goals >= 5)
@@ -481,6 +488,7 @@ def fetch_player_stats_fast(player_info: Dict) -> Optional[Dict]:
             "hit_rate_2plus": round(hit_2, 1),
             "hit_rate_3plus": round(hit_3, 1),
             "hit_rate_4plus": round(hit_4, 1),
+            "hit_rate_5plus": round(hit_5, 1),
             "avg_sog": round(avg, 2),
             "last_5_avg": round(l5_avg, 2),
             "last_10_avg": round(l10_avg, 2),
@@ -490,7 +498,6 @@ def fetch_player_stats_fast(player_info: Dict) -> Optional[Dict]:
             "current_streak": streak,
             "home_avg": round(home_avg, 2),
             "away_avg": round(away_avg, 2),
-            "bust_rate": round(bust_rate, 1),
             "is_pp1": is_pp1,
             "is_b2b": is_b2b,
             "pp_goals": pp_goals,
@@ -625,7 +632,7 @@ def show_model_explanation():
 # ============================================================================
 def main():
     st.title("🏒 NHL SOG Analyzer")
-    st.caption("v3.9 | Bust Rate + Results Tracker + Debug")
+    st.caption("v4.0 | Bust Rate + Auto-Track + Debug")
     
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -845,22 +852,19 @@ def display_all_results(plays: List[Dict], threshold: int, date_str: str):
             | B2B | Back-to-back game |
             """)
         with col2:
-            st.markdown("""
-            **Trend**
-            | Icon | Meaning |
-            |------|---------|
-            | 🔥 | Hot - L5 > Season avg |
-            | ❄️ | Cold - L5 < Season avg |
-            | ➡️ | Steady |
+            st.markdown(f"""
+            **Key Columns**
+            | Column | Meaning |
+            |--------|---------|
+            | Hit% | % games hitting O{threshold-0.5} |
+            | Safe% | % games with {threshold+1}+ SOG |
+            | Model% | Predicted prob today |
             
-            **Score Colors**
-            | Color | Score | Grade |
-            |-------|-------|-------|
-            | 🟢 | 85+ | A+ |
-            | 🔵 | 75-84 | A |
-            | 🟡 | 65-74 | B+ |
-            | 🟠 | 55-64 | B |
-            | 🔴 | <55 | C/D |
+            **Safe% = Buffer Zone**
+            
+            For **O{threshold-0.5}**: Safe% shows how often they get **{threshold+1}+ SOG** (one extra shot as buffer for stat corrections).
+            
+            Higher Safe% = safer parlay leg.
             """)
         with col3:
             st.markdown("""
@@ -883,6 +887,9 @@ def display_all_results(plays: List[Dict], threshold: int, date_str: str):
     
     hit_key = f"hit_rate_{threshold}plus"
     prob_key = f"prob_{threshold}plus"
+    
+    # Safe clear key: threshold + 1 (e.g., O1.5 → 3+, O2.5 → 4+, O3.5 → 5+)
+    safe_key = f"hit_rate_{threshold + 1}plus"
     
     a_plus = len([p for p in plays if p["parlay_grade"] == "A+"])
     a_grade = len([p for p in plays if p["parlay_grade"] == "A"])
@@ -922,7 +929,7 @@ def display_all_results(plays: List[Dict], threshold: int, date_str: str):
             "Hit%": p[hit_key],
             "Avg": p["avg_sog"],
             "L5": p["last_5_avg"],
-            "Bust%": p.get("bust_rate", 0),
+            "Safe%": p.get(safe_key, 0),  # % with buffer (threshold + 1)
             "Floor": p["floor"],
             "Trend": play["trend"],
             "Def": def_display,
@@ -937,6 +944,7 @@ def display_all_results(plays: List[Dict], threshold: int, date_str: str):
             "": st.column_config.TextColumn("", width="small"),
             "Model%": st.column_config.ProgressColumn("Model%", min_value=0, max_value=100, format="%.1f%%"),
             "Hit%": st.column_config.NumberColumn("Hit%", format="%.0f%%"),
+            "Safe%": st.column_config.NumberColumn("Safe%", format="%.0f%%", help=f"% of games with {threshold+1}+ SOG (buffer)"),
         }
     )
     
@@ -948,6 +956,7 @@ def show_best_bets(plays: List[Dict], threshold: int):
     
     hit_key = f"hit_rate_{threshold}plus"
     prob_key = f"prob_{threshold}plus"
+    safe_key = f"hit_rate_{threshold + 1}plus"
     
     elite = [p for p in plays if p["parlay_grade"] in ["A+", "A"]]
     good = [p for p in plays if p["parlay_grade"] in ["B+", "B"]]
@@ -969,8 +978,8 @@ def show_best_bets(plays: List[Dict], threshold: int):
                 "vs": play["opponent"],
                 "Model%": f"{play[prob_key]:.1f}%",
                 "Hit%": f"{p[hit_key]:.0f}%",
+                "Safe%": f"{p.get(safe_key, 0):.0f}%",
                 "Avg": p["avg_sog"],
-                "σ": p["std_dev"],
                 "Floor": p["floor"],
             })
         st.dataframe(pd.DataFrame(elite_data), use_container_width=True, hide_index=True)
@@ -985,7 +994,8 @@ def show_best_bets(plays: List[Dict], threshold: int):
     if good:
         good_data = [{"Player": p["player"]["name"], "Score": p["parlay_score"], "Grade": p["parlay_grade"],
                       "Tags": p["tags"], "vs": p["opponent"], "Model%": f"{p[prob_key]:.1f}%", 
-                      "Hit%": f"{p['player'][hit_key]:.0f}%"} for p in good]
+                      "Hit%": f"{p['player'][hit_key]:.0f}%",
+                      "Safe%": f"{p['player'].get(safe_key, 0):.0f}%"} for p in good]
         st.dataframe(pd.DataFrame(good_data), use_container_width=True, hide_index=True)
     
     st.markdown("---")
@@ -993,7 +1003,8 @@ def show_best_bets(plays: List[Dict], threshold: int):
     st.subheader(f"⚠️ Risky ({len(risky)})")
     if risky:
         risky_data = [{"Player": p["player"]["name"], "Score": p["parlay_score"], "Grade": p["parlay_grade"],
-                       "vs": p["opponent"], "Model%": f"{p[prob_key]:.1f}%"} for p in risky]
+                       "vs": p["opponent"], "Model%": f"{p[prob_key]:.1f}%",
+                       "Safe%": f"{p['player'].get(safe_key, 0):.0f}%"} for p in risky]
         st.dataframe(pd.DataFrame(risky_data), use_container_width=True, hide_index=True)
 
 def show_parlays(plays: List[Dict], games: List[Dict], threshold: int, unit_size: float):
@@ -1198,9 +1209,17 @@ def check_and_update_results(check_date: str, threshold: int):
     
     picks = st.session_state.saved_picks[check_date]
     
-    # Build lookups - by player_id AND by name (fallback)
-    pick_by_id = {p["player_id"]: p for p in picks}
-    pick_by_name = {p["player"].lower(): p for p in picks}
+    # Build lookups - convert player_id to STRING for consistent comparison
+    pick_by_id = {str(p["player_id"]): p for p in picks}
+    pick_by_name = {p["player"].lower().strip(): p for p in picks}
+    
+    # Debug: show what we're looking for
+    debug_info = []
+    debug_info.append(f"Looking for {len(picks)} players:")
+    for p in picks[:5]:  # Show first 5
+        debug_info.append(f"  - ID:{p['player_id']} Name:'{p['player']}'")
+    if len(picks) > 5:
+        debug_info.append(f"  ... and {len(picks)-5} more")
     
     # Fetch games for that date
     games = get_todays_schedule(check_date)
@@ -1213,6 +1232,7 @@ def check_and_update_results(check_date: str, threshold: int):
     games_checked = 0
     games_finished = 0
     game_states = []
+    boxscore_players = []  # Debug: track players found in boxscores
     
     for game in games:
         try:
@@ -1220,7 +1240,7 @@ def check_and_update_results(check_date: str, threshold: int):
             resp = requests.get(box_url, timeout=15)
             
             if resp.status_code != 200:
-                game_states.append(f"{game['away_team']}@{game['home_team']}: API error")
+                game_states.append(f"{game['away_team']}@{game['home_team']}: API error {resp.status_code}")
                 continue
             
             box_data = resp.json()
@@ -1242,6 +1262,7 @@ def check_and_update_results(check_date: str, threshold: int):
                     
                     for player in players:
                         pid = player.get("playerId")
+                        pid_str = str(pid) if pid else ""
                         
                         # Get player name from boxscore
                         name_data = player.get("name", {})
@@ -1252,18 +1273,26 @@ def check_and_update_results(check_date: str, threshold: int):
                         
                         actual_sog = player.get("sog", 0)
                         
-                        # Try to match by ID first
+                        # Track for debug
+                        boxscore_players.append(f"ID:{pid} Name:'{player_name}' SOG:{actual_sog}")
+                        
+                        # Try to match by ID first (as string)
                         matched_pick = None
-                        if pid and pid in pick_by_id:
-                            matched_pick = pick_by_id[pid]
+                        match_method = ""
+                        
+                        if pid_str and pid_str in pick_by_id:
+                            matched_pick = pick_by_id[pid_str]
+                            match_method = "ID"
                         # Fallback to name matching
-                        elif player_name and player_name.lower() in pick_by_name:
-                            matched_pick = pick_by_name[player_name.lower()]
+                        elif player_name and player_name.lower().strip() in pick_by_name:
+                            matched_pick = pick_by_name[player_name.lower().strip()]
+                            match_method = "name"
                         
                         if matched_pick:
                             matched_pick["actual_sog"] = actual_sog
                             matched_pick["hit"] = 1 if actual_sog >= threshold else 0
                             results_found += 1
+                            debug_info.append(f"✅ Matched ({match_method}): {player_name} = {actual_sog} SOG")
             
             time.sleep(0.05)
             
@@ -1279,10 +1308,18 @@ def check_and_update_results(check_date: str, threshold: int):
         for gs in game_states:
             st.text(gs)
     
+    # Show debug info
+    with st.expander("🐛 Debug: Matching Details"):
+        st.text("\n".join(debug_info))
+        st.markdown("---")
+        st.text(f"Boxscore players found (first 20 of {len(boxscore_players)}):")
+        for bp in boxscore_players[:20]:
+            st.text(f"  {bp}")
+    
     if games_finished == 0:
         st.warning(f"⏳ No finished games found. {games_checked} games checked - may still be in progress.")
     elif results_found == 0:
-        st.warning(f"⚠️ {games_finished} games finished but no picks matched. Check player names.")
+        st.error(f"⚠️ {games_finished} games finished but no picks matched. Check debug info above.")
     else:
         st.success(f"✅ Updated {results_found} picks from {games_finished} finished games")
 
@@ -1484,28 +1521,34 @@ def show_help():
     - High floor (never gets completely shut out)
     - Good volume (averages lots of shots)
     
-    ## What is Bust Rate?
+    ## What is Safe%?
     
-    **Bust Rate = % of games with 0-1 SOG**
+    **Safe% = % of games with EXTRA shots (buffer for stat corrections)**
     
-    This is the key parlay killer metric. Even stars have bad games.
+    | Threshold | Hit% Shows | Safe% Shows |
+    |-----------|------------|-------------|
+    | O1.5 | 2+ SOG | **3+ SOG** |
+    | O2.5 | 3+ SOG | **4+ SOG** |
+    | O3.5 | 4+ SOG | **5+ SOG** |
     
-    | Player | Avg | Bust% | Risk Level |
-    |--------|-----|-------|------------|
-    | Elite | 4.0 | 3% | Very safe |
-    | Good | 3.5 | 8% | Safe |
-    | Average | 3.0 | 15% | Some risk |
-    | Risky | 2.5 | 25% | Parlay killer |
+    ### Why Safe% Matters
     
-    ## Why Bust Rate > Variance?
+    Stat corrections happen! If you bet O1.5 and a player gets **exactly 2 SOG**, one correction could make you lose.
     
-    **Old approach (variance σ):**
-    - MacKinnon σ=2.2 → PENALIZED
-    - But his variance is UPSIDE (7-10 SOG games)
+    | Player | Hit% (2+) | Safe% (3+) | Risk |
+    |--------|-----------|------------|------|
+    | Player A | 85% | **70%** | Low - usually clears by 2+ |
+    | Player B | 85% | **40%** | High - often exactly 2 |
     
-    **New approach (bust rate):**
-    - MacKinnon bust rate ~5% → REWARDED
-    - Only measures DOWNSIDE risk
+    **Same hit rate, but Player A is much safer!**
+    
+    | Safe% | Meaning |
+    |-------|---------|
+    | 70%+ | Excellent - safely clears most games |
+    | 60-70% | Good buffer |
+    | 50-60% | Decent |
+    | 40-50% | Thin margins |
+    | <40% | Often just barely clears |
     
     ## Grade Meanings
     
@@ -1538,23 +1581,22 @@ def show_help():
     
     ## 📈 Tracking Results
     
-    ### Workflow
-    1. **Before games**: Go to Track Results tab → Export picks
-    2. **After games**: Fetch actual results
-    3. **In Excel/Sheets**: Combine picks + results
-    4. **Upload**: Upload combined file to analyze
+    ### Workflow (Much Simpler Now!)
+    1. **Run Analysis** → Picks auto-saved
+    2. **After games end** → Go to Track Results tab → Click "Check Results"
+    3. **View report** → See hits/misses, grades performance
+    4. **Export** → Download history CSV for backup
     
     ### What We Track
     - Hit rate by Parlay Grade (A+, A, B+, etc.)
-    - Hit rate by Threshold (O1.5, O2.5, O3.5)
-    - Model calibration (predicted vs actual)
+    - Qualified vs Non-Qualified performance
+    - Running totals across all days
     
     ### Improving the Model
-    If tracking shows:
+    After 50+ tracked picks, look for:
     - **A+ grades hitting <85%** → Scoring is too generous
-    - **Model overconfident** → Reduce probability boosts
-    - **Model underconfident** → Increase probability boosts
-    - **High bust rate players hitting** → Reduce bust penalty
+    - **B grades hitting >80%** → Can loosen criteria
+    - **High bust% players still hitting** → Reduce bust penalty
     
     ## Recommended Strategy
     
