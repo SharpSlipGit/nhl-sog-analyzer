@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer v3.8
+NHL Shots on Goal Analyzer v3.9
 ===============================
 - BUST RATE: % of games with 0-1 SOG (replaces variance)
 - DEFENSE: 20 games, proper A-F grading, trend detection
-- RESULTS TRACKER: Export picks, fetch results, analyze performance
+- RESULTS TRACKER: Auto-save picks, one-click results check
+- LEGEND: Expandable tags/symbols reference
+- DEBUG: Game status details in results checker
 - NO ODDS API: Uses model + hit rate only
 """
 
@@ -82,6 +84,9 @@ MODEL_WEIGHTS = {
 # ============================================================================
 def get_est_datetime():
     return datetime.now(EST)
+
+def get_est_date():
+    return get_est_datetime().strftime("%Y-%m-%d")
 
 def implied_prob_to_american(prob: float) -> int:
     if prob <= 0: return 10000
@@ -620,7 +625,7 @@ def show_model_explanation():
 # ============================================================================
 def main():
     st.title("🏒 NHL SOG Analyzer")
-    st.caption("v3.8 | Bust Rate + Results Tracker")
+    st.caption("v3.9 | Bust Rate + Results Tracker + Debug")
     
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -817,6 +822,64 @@ def display_all_results(plays: List[Dict], threshold: int, date_str: str):
     st.caption("Sorted by Parlay Score (best parlay legs first)")
     
     show_model_explanation()
+    
+    # Tags Legend
+    with st.expander("🏷️ Tags & Symbols Legend", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown("""
+            **Status Icons**
+            | Icon | Meaning |
+            |------|---------|
+            | ✅ | Qualified (75%+ hit rate) |
+            | ⚠️ | Not qualified / Cold |
+            
+            **Player Tags**
+            | Tag | Meaning |
+            |-----|---------|
+            | ⚡ | PP1 player (power play) |
+            | 🛡️ | Floor ≥1 (never 0 SOG) |
+            | 🔥5G | 5+ game hit streak |
+            | 🔥7G | 7+ game hit streak |
+            | 🔥10G | 10+ game hit streak |
+            | B2B | Back-to-back game |
+            """)
+        with col2:
+            st.markdown("""
+            **Trend**
+            | Icon | Meaning |
+            |------|---------|
+            | 🔥 | Hot - L5 > Season avg |
+            | ❄️ | Cold - L5 < Season avg |
+            | ➡️ | Steady |
+            
+            **Score Colors**
+            | Color | Score | Grade |
+            |-------|-------|-------|
+            | 🟢 | 85+ | A+ |
+            | 🔵 | 75-84 | A |
+            | 🟡 | 65-74 | B+ |
+            | 🟠 | 55-64 | B |
+            | 🔴 | <55 | C/D |
+            """)
+        with col3:
+            st.markdown("""
+            **Defense Grade (SA/G)**
+            | Grade | Shots Allowed |
+            |-------|---------------|
+            | A+ | 34+ (easy) |
+            | A | 32-34 |
+            | B | 30-32 |
+            | C | 28-30 (avg) |
+            | D | 26-28 |
+            | F | <26 (tough) |
+            
+            **Defense Trend**
+            | Icon | Meaning |
+            |------|---------|
+            | 📈 | Loosening (good) |
+            | 📉 | Tightening (bad) |
+            """)
     
     hit_key = f"hit_rate_{threshold}plus"
     prob_key = f"prob_{threshold}plus"
@@ -1135,8 +1198,9 @@ def check_and_update_results(check_date: str, threshold: int):
     
     picks = st.session_state.saved_picks[check_date]
     
-    # Build lookup of player_id to pick
-    pick_lookup = {p["player_id"]: p for p in picks}
+    # Build lookups - by player_id AND by name (fallback)
+    pick_by_id = {p["player_id"]: p for p in picks}
+    pick_by_name = {p["player"].lower(): p for p in picks}
     
     # Fetch games for that date
     games = get_todays_schedule(check_date)
@@ -1146,6 +1210,9 @@ def check_and_update_results(check_date: str, threshold: int):
         return
     
     results_found = 0
+    games_checked = 0
+    games_finished = 0
+    game_states = []
     
     for game in games:
         try:
@@ -1153,14 +1220,20 @@ def check_and_update_results(check_date: str, threshold: int):
             resp = requests.get(box_url, timeout=15)
             
             if resp.status_code != 200:
+                game_states.append(f"{game['away_team']}@{game['home_team']}: API error")
                 continue
             
             box_data = resp.json()
+            games_checked += 1
             
             # Check game state
-            game_state = box_data.get("gameState", "")
+            game_state = box_data.get("gameState", "UNKNOWN")
+            game_states.append(f"{game['away_team']}@{game['home_team']}: {game_state}")
+            
             if game_state not in ["OFF", "FINAL"]:
                 continue  # Game not finished
+            
+            games_finished += 1
             
             # Get player stats
             for team_key in ["homeTeam", "awayTeam"]:
@@ -1169,21 +1242,49 @@ def check_and_update_results(check_date: str, threshold: int):
                     
                     for player in players:
                         pid = player.get("playerId")
-                        if pid and pid in pick_lookup:
-                            actual_sog = player.get("sog", 0)
-                            pick_lookup[pid]["actual_sog"] = actual_sog
-                            pick_lookup[pid]["hit"] = 1 if actual_sog >= threshold else 0
+                        
+                        # Get player name from boxscore
+                        name_data = player.get("name", {})
+                        if isinstance(name_data, dict):
+                            player_name = name_data.get("default", "")
+                        else:
+                            player_name = str(name_data)
+                        
+                        actual_sog = player.get("sog", 0)
+                        
+                        # Try to match by ID first
+                        matched_pick = None
+                        if pid and pid in pick_by_id:
+                            matched_pick = pick_by_id[pid]
+                        # Fallback to name matching
+                        elif player_name and player_name.lower() in pick_by_name:
+                            matched_pick = pick_by_name[player_name.lower()]
+                        
+                        if matched_pick:
+                            matched_pick["actual_sog"] = actual_sog
+                            matched_pick["hit"] = 1 if actual_sog >= threshold else 0
                             results_found += 1
             
             time.sleep(0.05)
             
         except Exception as e:
+            game_states.append(f"{game['away_team']}@{game['home_team']}: Error - {e}")
             continue
     
     # Update session state
-    st.session_state.saved_picks[check_date] = list(pick_lookup.values())
+    st.session_state.saved_picks[check_date] = picks
     
-    st.success(f"✅ Updated {results_found} picks with actual results")
+    # Show game status
+    with st.expander("🔍 Game Status Details"):
+        for gs in game_states:
+            st.text(gs)
+    
+    if games_finished == 0:
+        st.warning(f"⏳ No finished games found. {games_checked} games checked - may still be in progress.")
+    elif results_found == 0:
+        st.warning(f"⚠️ {games_finished} games finished but no picks matched. Check player names.")
+    else:
+        st.success(f"✅ Updated {results_found} picks from {games_finished} finished games")
 
 
 def show_date_report(report_date: str, threshold: int):
