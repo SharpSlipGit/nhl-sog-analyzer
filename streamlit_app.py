@@ -991,7 +991,7 @@ def generate_best_parlay_v7(plays: List[Dict], num_legs: int, threshold: int) ->
 # MAIN ANALYSIS (V7)
 # ============================================================================
 def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dict]:
-    """Run full V7 analysis with compact progress and dancing Farquaad."""
+    """Run full V7 analysis with compact progress."""
     
     games = get_todays_schedule(date_str)
     if not games:
@@ -1000,27 +1000,19 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
     
     st.session_state.games = games
     
-    # Farquaad quotes for loading
-    FARQUAAD_QUOTES = [
-        "These bitches better get puck on net.",
-        "Shoot the fucking puck, you overpaid donkeys.",
-        "I swear to God if you get shutout again...",
-        "0 SOG? In THIS economy?",
-        "My grandma could hit O1.5 and she's dead.",
+    # R-rated quotes
+    QUOTES = [
         "Stop passing and fucking shoot already.",
-        "I need 2 shots, not 2 assists. READ THE BET.",
-        "Parlay gods, please don't fuck me today.",
-        "If this hits I'm buying bottle service. If not, ramen.",
-        "Some of you will not hit... and your children will hear about it.",
-        "Get the puck on net or get the fuck off my slip.",
-        "PP1 means SHOOT ON THE POWER PLAY, dipshit.",
-        "3 SOG is not asking for much. Jesus Christ.",
+        "These bitches better get puck on net.",
+        "My grandma could hit O1.5 and she's dead.",
     ]
     
-    # Dancing Farquaad GIF (there are a few options online)
-    FARQUAAD_GIF = "https://media1.tenor.com/m/bpfIKwJD2MEAAAAC/shrek-lord-farquaad.gif"
+    # Ron Burgundy "It's Science" GIF
+    SCIENCE_GIF = "https://gifrific.com/wp-content/uploads/2012/06/its-science-anchorman.gif"
     
-    # Compact layout: games table small
+    import random
+    
+    # Compact layout
     with status_container:
         st.caption(f"📅 {date_str} | {len(games)} games")
         
@@ -1028,17 +1020,18 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
         games_str = " • ".join([f"{g['away_team']}@{g['home_team']}" for g in games])
         st.code(games_str, language=None)
         
-        # Two columns: status text + Farquaad
+        # Two columns: status + GIF
         col1, col2 = st.columns([3, 1])
         
         with col1:
             progress_bar = st.progress(0)
             status_text = st.empty()
             quote_text = st.empty()
+            quote_text.caption(f"💬 *\"{random.choice(QUOTES)}\"*")
         
         with col2:
-            farquaad = st.empty()
-            farquaad.image(FARQUAAD_GIF, width=120)
+            gif_container = st.empty()
+            gif_container.image(SCIENCE_GIF, width=150)
     
     # Build team info
     teams_playing = set()
@@ -1048,9 +1041,6 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
         teams_playing.add(game["home_team"])
         game_info[game["away_team"]] = {"opponent": game["home_team"], "home_away": "AWAY", "time": game["time"], "game_id": game["id"]}
         game_info[game["home_team"]] = {"opponent": game["away_team"], "home_away": "HOME", "time": game["time"], "game_id": game["id"]}
-    
-    import random
-    quote_text.caption(f"💬 *\"{random.choice(FARQUAAD_QUOTES)}\"*")
     
     # Fetch defense stats
     team_defense = {}
@@ -1065,7 +1055,7 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
     # Fetch rosters
     progress_bar.progress(0.45)
     status_text.text("📋 Loading rosters...")
-    quote_text.caption(f"💬 *\"{random.choice(FARQUAAD_QUOTES)}\"*")
+    quote_text.caption(f"💬 *\"{random.choice(QUOTES)}\"*")
     
     all_players = []
     for team in teams_playing:
@@ -1080,11 +1070,11 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
     for i, player_info in enumerate(all_players):
         pct = 0.45 + (i / total) * 0.55
         progress_bar.progress(pct)
-        status_text.text(f"🔍 {player_info['name'][:20]}... ({i+1}/{total}) | ✅ {qualified_count} found")
+        status_text.text(f"🔍 {player_info['name'][:18]}... ({i+1}/{total}) | ✅ {qualified_count} found")
         
-        # Change quote every ~30 players
-        if i % 30 == 0:
-            quote_text.caption(f"💬 *\"{random.choice(FARQUAAD_QUOTES)}\"*")
+        # Change quote every ~40 players
+        if i % 40 == 0 and i > 0:
+            quote_text.caption(f"💬 *\"{random.choice(QUOTES)}\"*")
         
         stats = fetch_player_stats(player_info)
         if not stats:
@@ -1161,12 +1151,12 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
     progress_bar.empty()
     status_text.empty()
     quote_text.empty()
-    farquaad.empty()
+    gif_container.empty()
     
     # Sort by score
     plays.sort(key=lambda x: x.get("parlay_score", 0), reverse=True)
     
-    # Final Farquaad message
+    # Final message
     locks = len([p for p in plays if "LOCK" in p["tier"]])
     if locks > 0:
         status_container.success(f"🔒 {locks} LOCK(s) found. Don't fuck this up.")
@@ -1243,37 +1233,47 @@ def display_all_results(plays: List[Dict], threshold: int):
             "L10": player.get("last_10_avg", player["avg_sog"]),
             "SOG/60": player.get("sog_per_60", 0),
             "TOI": toi_str,
-            "Prob": p['model_prob'] / 100,  # As decimal for progress bar
+            "Prob": p['model_prob'],  # Raw percentage (0-100)
         }
         rows.append(row)
     
     df = pd.DataFrame(rows)
     
-    # Display with column config for progress bar
+    # Display with column config - compact widths
     st.dataframe(
         df, 
         use_container_width=True, 
         hide_index=True, 
         height=500,
         column_config={
-            "Player": st.column_config.TextColumn("Player", width="medium"),
+            "Score": st.column_config.TextColumn("Score", width="small"),
+            "Tier": st.column_config.TextColumn("Tier", width="small"),
+            "Player": st.column_config.TextColumn("Player", width="small"),
+            "Tags": st.column_config.TextColumn("Tags", width="small"),
+            "Team": st.column_config.TextColumn("Team", width="small"),
+            "vs": st.column_config.TextColumn("vs", width="small"),
+            "Loc": st.column_config.TextColumn("Loc", width="small"),
+            "Hit%": st.column_config.TextColumn("Hit%", width="small"),
+            "Cush%": st.column_config.TextColumn("Cush%", width="small"),
+            "Shut%": st.column_config.TextColumn("Shut%", width="small"),
+            "Avg": st.column_config.NumberColumn("Avg", format="%.2f", width="small"),
+            "L5": st.column_config.NumberColumn("L5", format="%.1f", width="small"),
+            "L10": st.column_config.NumberColumn("L10", format="%.1f", width="small"),
+            "SOG/60": st.column_config.NumberColumn("SOG/60", format="%.1f", width="small"),
+            "TOI": st.column_config.TextColumn("TOI", width="small"),
             "Prob": st.column_config.ProgressColumn(
                 "Prob%",
                 help="Model probability",
-                format="%.0f%%",
+                format="%d%%",
                 min_value=0,
-                max_value=1,
+                max_value=100,
             ),
-            "Avg": st.column_config.NumberColumn("Avg", format="%.2f"),
-            "L5": st.column_config.NumberColumn("L5", format="%.1f"),
-            "L10": st.column_config.NumberColumn("L10", format="%.1f"),
-            "SOG/60": st.column_config.NumberColumn("SOG/60", format="%.1f"),
         }
     )
     
     # Download
     csv_df = df.copy()
-    csv_df["Prob"] = (csv_df["Prob"] * 100).round(0).astype(int).astype(str) + "%"
+    csv_df["Prob"] = csv_df["Prob"].round(0).astype(int).astype(str) + "%"
     csv = csv_df.to_csv(index=False)
     st.download_button("📥 Download CSV", csv, f"nhl_sog_v72_{get_est_date()}.csv", "text/csv")
 
@@ -1613,11 +1613,6 @@ def main():
             display_all_results(st.session_state.plays, threshold)
         elif not run_analysis:
             st.info("👈 Click **Run Analysis** to fetch today's plays")
-            games = get_todays_schedule(date_str)
-            if games:
-                st.subheader(f"📅 Games on {date_str}")
-                for game in games:
-                    st.write(f"**{game['away_team']}** @ **{game['home_team']}** - {game['time']}")
     
     with tab2:
         if st.session_state.plays:
