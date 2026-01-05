@@ -1157,46 +1157,51 @@ def fetch_results(check_date: str, threshold: int, status_container):
         # Update parlay results if we have a saved parlay for this date
         if check_date in st.session_state.parlay_history:
             parlay = st.session_state.parlay_history[check_date]
-            parlay_threshold = parlay.get("threshold", 2)
+            # Skip non-dict values (e.g., "init" key from JSONBin)
+            if not isinstance(parlay, dict):
+                parlay = None
             
-            # Build lookup from results
-            results_by_id = {}
-            results_by_name = {}
-            for pick in picks:
-                if "actual_sog" in pick:
-                    pid = str(pick.get("player_id", ""))
-                    pname = pick.get("player", "").lower().strip()
-                    results_by_id[pid] = pick
-                    if pname:
-                        results_by_name[pname] = pick
-            
-            # Check each parlay leg
-            legs_hit = 0
-            legs_checked = 0
-            for leg in parlay.get("legs", []):
-                leg_pid = str(leg.get("player_id", ""))
-                leg_name = leg.get("player_name", "").lower().strip()
+            if parlay:
+                parlay_threshold = parlay.get("threshold", 2)
                 
-                matched = None
-                if leg_pid in results_by_id:
-                    matched = results_by_id[leg_pid]
-                elif leg_name in results_by_name:
-                    matched = results_by_name[leg_name]
+                # Build lookup from results
+                results_by_id = {}
+                results_by_name = {}
+                for pick in picks:
+                    if "actual_sog" in pick:
+                        pid = str(pick.get("player_id", ""))
+                        pname = pick.get("player", "").lower().strip()
+                        results_by_id[pid] = pick
+                        if pname:
+                            results_by_name[pname] = pick
                 
-                if matched and "actual_sog" in matched:
-                    legs_checked += 1
-                    actual = matched["actual_sog"]
-                    leg["actual_sog"] = actual
-                    leg["hit"] = 1 if actual >= parlay_threshold else 0
-                    if leg["hit"]:
-                        legs_hit += 1
-            
-            # Update parlay result
-            if legs_checked == len(parlay.get("legs", [])):
-                parlay["legs_hit"] = legs_hit
-                parlay["result"] = "WIN" if legs_hit == len(parlay["legs"]) else "LOSS"
-                st.session_state.parlay_history[check_date] = parlay
-                save_parlay_history(st.session_state.parlay_history)
+                # Check each parlay leg
+                legs_hit = 0
+                legs_checked = 0
+                for leg in parlay.get("legs", []):
+                    leg_pid = str(leg.get("player_id", ""))
+                    leg_name = leg.get("player_name", "").lower().strip()
+                    
+                    matched = None
+                    if leg_pid in results_by_id:
+                        matched = results_by_id[leg_pid]
+                    elif leg_name in results_by_name:
+                        matched = results_by_name[leg_name]
+                    
+                    if matched and "actual_sog" in matched:
+                        legs_checked += 1
+                        actual = matched["actual_sog"]
+                        leg["actual_sog"] = actual
+                        leg["hit"] = 1 if actual >= parlay_threshold else 0
+                        if leg["hit"]:
+                            legs_hit += 1
+                
+                # Update parlay result
+                if legs_checked == len(parlay.get("legs", [])):
+                    parlay["legs_hit"] = legs_hit
+                    parlay["result"] = "WIN" if legs_hit == len(parlay["legs"]) else "LOSS"
+                    st.session_state.parlay_history[check_date] = parlay
+                    save_parlay_history(st.session_state.parlay_history)
     
     if games_finished == 0:
         status_container.warning("⏳ No finished games found")
@@ -1930,6 +1935,9 @@ def display_results_tracker(threshold: int):
     # Show results for selected date
     if check_date_str in st.session_state.results_history:
         picks = st.session_state.results_history[check_date_str]
+        # Skip non-list values (e.g., "init" key from JSONBin)
+        if not isinstance(picks, list):
+            picks = []
         picks_with_results = [p for p in picks if "actual_sog" in p]
         
         # ================================================================
@@ -1937,6 +1945,9 @@ def display_results_tracker(threshold: int):
         # ================================================================
         if check_date_str in st.session_state.parlay_history:
             parlay = st.session_state.parlay_history[check_date_str]
+            # Skip non-dict values (e.g., "init" key from JSONBin)
+            if not isinstance(parlay, dict):
+                parlay = {}
             result = parlay.get("result")
             legs_hit = parlay.get("legs_hit")
             num_legs = parlay.get("num_legs", len(parlay.get("legs", [])))
@@ -2020,7 +2031,9 @@ def display_results_tracker(threshold: int):
     # PARLAY RECORD
     # ================================================================
     if st.session_state.parlay_history:
-        parlays_with_results = [p for p in st.session_state.parlay_history.values() if p.get("result")]
+        # Filter to only valid parlay dicts (skip "init" key from JSONBin setup)
+        parlays_with_results = [p for p in st.session_state.parlay_history.values() 
+                                if isinstance(p, dict) and p.get("result")]
         
         if parlays_with_results:
             wins = sum(1 for p in parlays_with_results if p["result"] == "WIN")
@@ -2049,6 +2062,9 @@ def display_results_tracker(threshold: int):
             with st.expander("📜 Parlay History", expanded=False):
                 parlay_rows = []
                 for date, p in sorted(st.session_state.parlay_history.items(), reverse=True):
+                    # Skip non-dict values (e.g., "init" key from JSONBin)
+                    if not isinstance(p, dict):
+                        continue
                     if p.get("result"):
                         legs_str = " + ".join([leg.get("player_name", "?").split()[-1] for leg in p.get("legs", [])])
                         parlay_rows.append({
@@ -2070,6 +2086,9 @@ def display_results_tracker(threshold: int):
         
         all_picks = []
         for date, picks in st.session_state.results_history.items():
+            # Skip non-list values (e.g., "init": true from JSONBin setup)
+            if not isinstance(picks, list):
+                continue
             for p in picks:
                 if "actual_sog" in p:
                     all_picks.append(p)
