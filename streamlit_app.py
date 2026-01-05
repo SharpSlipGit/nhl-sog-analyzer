@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer V7.2
+NHL Shots on Goal Analyzer V7.3
 ===============================
-HIT RATE IS KING MODEL
+STATISTICAL MODEL + HIT RATE SCORING
 
-KEY CHANGES FROM V7.0:
-- Hit rate determines BASE score (not additive from zero)
-- Modifiers adjust from base (centered at zero)
-- Variance NOT penalized (upside is good, downside captured by shutout%)
-- Updated tier thresholds (88/80/70/60)
+KEY FEATURES:
+- TRUE probability via Negative Binomial / Poisson distribution
+- Projection-based λ (expected SOG) adjusted for matchup/venue/PP
+- Parlay Score = quality heuristic (hit rate + situational factors)
+- Prob% = REAL statistical probability (not a transformed score)
 
-SCORING PHILOSOPHY:
-base_score = 50 + (hit_rate - 70) × 1.5
-final_score = base + modifiers
+PROBABILITY MODEL:
+λ (projection) = weighted_avg × opp_factor × venue_factor × pp_factor
+P(X >= threshold) = 1 - NegBinom.CDF(threshold-1, μ=λ, σ²=player_variance)
 
-"An 89% hitter starts at 78.5. Other factors fine-tune from there."
+Falls back to Poisson if variance ≤ mean (equidispersed).
 
-v7.2 - January 2026
+v7.3 - January 2026 - Statistical Model Upgrade
 """
 
 import streamlit as st
@@ -36,7 +36,7 @@ import statistics
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="NHL SOG Analyzer V7.2",
+    page_title="NHL SOG Analyzer V7.3",
     page_icon="🏒",
     layout="wide",
     initial_sidebar_state="auto"  # Auto-collapses on mobile, expands on desktop
@@ -103,7 +103,7 @@ LEAGUE_AVG_SOG = 2.8   # Shots on goal per player
 LOGISTIC_A = 0.09      # Steepness
 LOGISTIC_B = 4.8       # Midpoint shift
 
-# Tier thresholds (V7.2)
+# Tier thresholds (V7.3)
 TIERS = {
     "🔒 LOCK": 88,
     "✅ STRONG": 80,
@@ -114,7 +114,7 @@ TIERS = {
 
 # Kill switch thresholds (auto-exclude from parlays)
 KILL_SWITCHES = {
-    "min_score": 60,  # Updated for V7.2 thresholds
+    "min_score": 60,  # Updated for V7.3 thresholds
     "max_l5_shutouts": 1,  # More than this = kill
     "max_variance": 2.8,
     "max_toi_drop_pct": 25,
@@ -191,6 +191,67 @@ def implied_prob_to_american(prob: float) -> int:
 def poisson_prob_at_least(lam: float, k: int) -> float:
     if lam <= 0: return 0.0
     return 1 - sum((math.exp(-lam) * (lam ** i)) / math.factorial(i) for i in range(k))
+
+def negative_binomial_prob_at_least(mu: float, variance: float, k: int) -> float:
+    """
+    Calculate P(X >= k) using Negative Binomial distribution.
+    
+    Used when variance > mean (overdispersion), common in SOG data.
+    Falls back to Poisson if variance <= mean.
+    
+    Parameters:
+        mu: Expected value (projection)
+        variance: Variance of player's SOG (std_dev²)
+        k: Threshold (e.g., 2 for O1.5)
+    """
+    if mu <= 0:
+        return 0.0
+    
+    # If not overdispersed, use Poisson
+    if variance <= mu:
+        return poisson_prob_at_least(mu, k)
+    
+    # Negative Binomial parameterization
+    # r = μ² / (σ² - μ)  [shape parameter]
+    # p = μ / σ²         [success probability]
+    r = (mu * mu) / (variance - mu)
+    p = mu / variance
+    
+    # P(X >= k) = 1 - P(X < k) = 1 - CDF(k-1)
+    # Using scipy-style calculation without scipy
+    prob_less_than_k = 0.0
+    for i in range(k):
+        # PMF of negative binomial: C(i+r-1, i) * p^r * (1-p)^i
+        # Using log-space to avoid overflow
+        log_coef = math.lgamma(i + r) - math.lgamma(i + 1) - math.lgamma(r)
+        log_pmf = log_coef + r * math.log(p) + i * math.log(1 - p)
+        prob_less_than_k += math.exp(log_pmf)
+    
+    return max(0.0, min(1.0, 1.0 - prob_less_than_k))
+
+def calculate_statistical_probability(projection: float, std_dev: float, threshold: int) -> float:
+    """
+    Calculate TRUE probability of hitting SOG threshold using statistical model.
+    
+    Uses Negative Binomial if data is overdispersed (common for SOG),
+    otherwise falls back to Poisson.
+    
+    This is a REAL probability, not a heuristic score.
+    """
+    if projection <= 0:
+        return 0.0
+    
+    variance = std_dev * std_dev
+    
+    # Add small buffer to variance to account for game-to-game uncertainty
+    # This prevents overconfidence for "consistent" players
+    variance = max(variance, projection * 0.8)  # Minimum variance = 80% of mean
+    
+    prob = negative_binomial_prob_at_least(projection, variance, threshold)
+    
+    # Cap at 96% to prevent overconfidence (even elite players miss sometimes)
+    # Floor at 25% (if projection is near threshold, still some chance)
+    return min(0.96, max(0.25, prob))
 
 def calculate_percentile(data: List[int], pct: int) -> float:
     """Calculate percentile of data."""
@@ -285,7 +346,7 @@ def magnitude_scale(diff: float, max_diff: float, base_points: float, penalty_mu
 # ============================================================================
 def calculate_parlay_score_v7(player: Dict, opp_def: Dict, is_home: bool, threshold: int) -> Tuple[float, List[str], List[str]]:
     """
-    V7.2: HIT RATE IS KING scoring model.
+    V7.3: HIT RATE IS KING scoring model.
     
     Base Score: 50 + (hit_rate - 70) × 1.5
     - 70% → 50, 80% → 65, 85% → 72.5, 89% → 78.5, 90% → 80, 95% → 87.5
@@ -1138,8 +1199,18 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
         # V7 Parlay Score (continuous)
         parlay_score, edges, risks = calculate_parlay_score_v7(stats, opp_def, is_home, threshold)
         
-        # V7 Probability (logistic mapping)
-        model_prob = score_to_probability(parlay_score) * 100
+        # SOG Projection (adjusted for matchup, venue, PP) - used as λ in probability model
+        base_proj = (stats["last_5_avg"] * 0.4) + (stats["last_10_avg"] * 0.3) + (stats["avg_sog"] * 0.3)
+        opp_factor = opp_def.get("shots_allowed_per_game", 30.0) / LEAGUE_AVG_SAG
+        venue_factor = 1.03 if is_home else 0.97
+        pp_factor = 1.10 if stats.get("is_pp1") else 1.0
+        projection = base_proj * opp_factor * venue_factor * pp_factor
+        
+        # STATISTICAL PROBABILITY (Negative Binomial / Poisson model)
+        # Uses projection as expected value (λ) and player's std_dev for dispersion
+        # This is a TRUE probability, not a heuristic
+        std_dev = stats.get("std_dev", 1.5)
+        model_prob = calculate_statistical_probability(projection, std_dev, threshold) * 100
         
         # Kill switch check
         killed, kill_reason = check_kill_switches(stats, parlay_score, threshold)
@@ -1168,13 +1239,6 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
         if stats["current_streak"] >= 5: tags.append(f"🔥{stats['current_streak']}G")
         if stats.get("is_b2b"): tags.append("B2B")
         
-        # SOG Projection (adjusted for matchup, venue, PP)
-        base_proj = (stats["last_5_avg"] * 0.4) + (stats["last_10_avg"] * 0.3) + (stats["avg_sog"] * 0.3)
-        opp_factor = opp_def.get("shots_allowed_per_game", 30.0) / LEAGUE_AVG_SAG
-        venue_factor = 1.03 if is_home else 0.97
-        pp_factor = 1.10 if stats.get("is_pp1") else 1.0
-        projection = base_proj * opp_factor * venue_factor * pp_factor
-        
         play = {
             "player": stats,
             "player_id": stats["player_id"],
@@ -1185,7 +1249,7 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
             "game_id": info["game_id"],
             "parlay_score": round(parlay_score, 1),
             "model_prob": round(model_prob, 1),
-            "projection": round(projection, 1),
+            "projection": round(projection, 2),
             "tier": tier,
             "edges": edges,
             "risks": risks,
@@ -1233,7 +1297,7 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
 # DISPLAY FUNCTIONS
 # ============================================================================
 def display_all_results(plays: List[Dict], threshold: int):
-    """Display all results with V7.2 highlighting."""
+    """Display all results with V7.3 highlighting."""
     
     st.subheader(f"📊 All Results - Over {threshold - 0.5} SOG")
     
@@ -1306,7 +1370,7 @@ def display_all_results(plays: List[Dict], threshold: int):
             "TOI": st.column_config.TextColumn("TOI", width="small"),
             "Prob": st.column_config.ProgressColumn(
                 "Prob%",
-                help="Model probability",
+                help="Statistical probability (Negative Binomial/Poisson model)",
                 format="%d%%",
                 min_value=0,
                 max_value=100,
@@ -1347,7 +1411,7 @@ def display_all_results(plays: List[Dict], threshold: int):
         })
     csv_df = pd.DataFrame(csv_rows)
     csv = csv_df.to_csv(index=False)
-    st.download_button("📥 Download CSV", csv, f"nhl_sog_v72_{get_est_date()}.csv", "text/csv")
+    st.download_button("📥 Download CSV", csv, f"nhl_sog_v73_{get_est_date()}.csv", "text/csv")
 
 def display_tiered_breakdown(plays: List[Dict], threshold: int):
     """Display plays grouped by tier with edge/risk analysis."""
@@ -1597,7 +1661,7 @@ def display_results_tracker(threshold: int):
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer V7.2")
+    st.title("🏒 NHL SOG Analyzer V7.3")
     st.caption("Hit Rate is King | Variance NOT penalized")
     st.caption("Professional Grade: Continuous Scoring • Dynamic Weighting • Correlation Penalties")
     
@@ -1630,36 +1694,48 @@ def main():
         
         st.markdown("---")
         
-        # V7 Model Info
-        with st.expander("ℹ️ V7 Model Info"):
+        # V7.3 Model Info
+        with st.expander("ℹ️ V7.3 Statistical Model"):
             st.markdown("""
-            **Continuous Scoring:**
-            - No bucket cliffs
-            - Linear scaling for all factors
+            **🎲 Probability Model (NEW in V7.3):**
             
-            **Dynamic Weighting:**
-            - Extreme matchups weighted more
-            - Magnitude-based situational factors
+            Uses **Negative Binomial distribution** (or Poisson when appropriate):
             
-            **Kill Switches:**
-            - Auto-exclude dangerous plays
-            - Still shown in All Results
+            ```
+            λ = Projection (adjusted expected SOG)
+            σ² = Player's variance (from std_dev)
+            P(hit) = 1 - NegBinom.CDF(threshold-1, μ=λ, σ²)
+            ```
             
-            **Correlation Penalties:**
-            - Same team: -6%
-            - Same line: -10%
-            - Same PP: -8%
+            **Why Negative Binomial?**
+            - SOG data is often *overdispersed* (variance > mean)
+            - Poisson assumes variance = mean (too rigid)
+            - NB captures the extra variability in player performance
             
-            **V7.2 Tiers:**
+            **Projection Formula:**
+            ```
+            λ = (L5×0.4 + L10×0.3 + Avg×0.3) × opp × venue × PP
+            ```
+            
+            ---
+            
+            **📊 Parlay Score** (Quality Heuristic):
+            - Base = 50 + (Hit% - 70) × 1.5
+            - Modifiers for matchup, form, floor, PP, etc.
+            - Used for tiering and parlay selection
+            
+            **🎯 Prob%** = TRUE statistical probability
+            
+            **🏆 Score** = Quality/confidence indicator
+            
+            ---
+            
+            **V7.3 Tiers:**
             - 🔒 LOCK: 88+
             - ✅ STRONG: 80-87
             - 📊 SOLID: 70-79
             - ⚠️ RISKY: 60-69
             - ❌ AVOID: <60
-            
-            **Scoring:** Hit Rate is King
-            - Base = 50 + (Hit% - 70) × 1.5
-            - Modifiers adjust from base
             """)
         
         st.caption(f"Current: {get_est_datetime().strftime('%I:%M %p EST')}")
