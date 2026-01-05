@@ -23,7 +23,6 @@ import math
 import pandas as pd
 from typing import Optional, List, Dict, Tuple
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 import statistics
 
@@ -48,9 +47,8 @@ MIN_HIT_RATE = 75
 EST = pytz.timezone('US/Eastern')
 
 # Speed settings
-MAX_WORKERS = 8  # Parallel API calls
 DEFENSE_GAMES = 5  # Reduced from 10
-CACHE_TTL_DEFENSE = 1800  # 30 min cache for defense (doesn't change fast)
+CACHE_TTL_DEFENSE = 1800  # 30 min cache for defense
 CACHE_TTL_SCHEDULE = 300  # 5 min cache for schedule
 
 MATCHUP_GRADES = {
@@ -303,17 +301,18 @@ def fetch_team_defense(team_abbrev: str) -> Dict:
     except:
         return {"team_abbrev": team_abbrev, "shots_allowed_per_game": 30.0, "shots_allowed_L5": 30.0, "grade": "C", "trend": "stable"}
 
-@st.cache_data(ttl=CACHE_TTL_DEFENSE)
-def get_team_defense_parallel(teams: List[str]) -> Dict[str, Dict]:
-    """Fetch defense stats for multiple teams in parallel."""
+def get_team_defense_safe(teams: List[str], status_text) -> Dict[str, Dict]:
+    """Fetch defense stats - sequential but reliable."""
     team_defense = {}
+    total = len(teams)
     
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_team = {executor.submit(fetch_team_defense, team): team for team in teams}
-        
-        for future in as_completed(future_to_team):
-            result = future.result()
-            team_defense[result["team_abbrev"]] = result
+    for i, team in enumerate(teams):
+        status_text.text(f"🛡️ Defense: {team} ({i+1}/{total})")
+        try:
+            result = fetch_team_defense(team)
+            team_defense[team] = result
+        except Exception as e:
+            team_defense[team] = {"team_abbrev": team, "shots_allowed_per_game": 30.0, "shots_allowed_L5": 30.0, "grade": "C", "trend": "stable"}
     
     return team_defense
 
@@ -608,7 +607,7 @@ def generate_sgp_for_game(plays: List[Dict], game_id: str, threshold: int, min_l
 # UI COMPONENTS
 # ============================================================================
 def show_model_explanation():
-    with st.expander("📖 Model v3.4 - How It Works", expanded=False):
+    with st.expander("📖 Model v3.4.1 - How It Works", expanded=False):
         col1, col2 = st.columns(2)
         
         with col1:
@@ -656,7 +655,7 @@ def show_model_explanation():
 # ============================================================================
 def main():
     st.title("🏒 NHL SOG Analyzer")
-    st.caption("v3.4 | Optimized Speed + Improved Model")
+    st.caption("v3.4.1 | Improved Model")
     
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -722,7 +721,7 @@ def main():
         show_help()
 
 def run_optimized_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[Dict]]:
-    """Optimized analysis with parallel fetching."""
+    """Analysis with progress tracking."""
     
     st.subheader(f"📅 {date_str}")
     games = get_todays_schedule(date_str)
@@ -746,102 +745,91 @@ def run_optimized_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], L
     st.markdown("---")
     progress_bar = st.progress(0)
     status_text = st.empty()
-    time_display = st.empty()
+    stats_display = st.empty()
     
     start_time = time.time()
     
-    # PARALLEL: Fetch defense stats
-    status_text.text(f"🛡️ Fetching defense stats for {len(teams_playing)} teams...")
-    team_defense = get_team_defense_parallel(list(teams_playing))
-    progress_bar.progress(20)
+    # Fetch defense stats (sequential but reliable)
+    status_text.text(f"🛡️ Fetching defense for {len(teams_playing)} teams...")
+    team_defense = get_team_defense_safe(list(teams_playing), status_text)
+    progress_bar.progress(15)
     
-    # PARALLEL: Fetch all rosters
+    # Fetch rosters (sequential)
     status_text.text("📋 Fetching rosters...")
     all_players = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        roster_futures = {executor.submit(fetch_roster, team): team for team in teams_playing}
-        for future in as_completed(roster_futures):
-            roster = future.result()
-            all_players.extend(roster)
-    progress_bar.progress(30)
+    for team in teams_playing:
+        roster = fetch_roster(team)
+        all_players.extend(roster)
+    progress_bar.progress(25)
     
-    # PARALLEL: Fetch player stats
-    status_text.text(f"🔍 Analyzing {len(all_players)} players...")
+    stats_display.text(f"Found {len(all_players)} players to analyze")
     
+    # Analyze players (sequential with progress)
     all_plays = []
-    completed = 0
     total = len(all_players)
     
-    def process_player(player_info):
-        stats = fetch_player_full(player_info)
-        if not stats:
-            return None
+    for i, player_info in enumerate(all_players):
+        pct = 25 + int((i / total) * 75)
+        progress_bar.progress(pct)
+        status_text.text(f"🔍 {player_info['name']} ({i+1}/{total})")
         
-        hit_rate = stats["hit_rate_2plus"] if threshold == 2 else stats["hit_rate_3plus"] if threshold == 3 else stats["hit_rate_4plus"]
-        if hit_rate < MIN_HIT_RATE:
-            return None
-        
-        info = game_info.get(player_info["team"])
-        if not info:
-            return None
-        
-        opp = info["opponent"]
-        opp_def = team_defense.get(opp, {"shots_allowed_per_game": 30.0, "grade": "C", "trend": "stable"})
-        is_home = info["home_away"] == "HOME"
-        
-        prob_2 = calculate_model_probability(stats, opp_def, is_home, 2)
-        prob_3 = calculate_model_probability(stats, opp_def, is_home, 3)
-        prob_4 = calculate_model_probability(stats, opp_def, is_home, 4)
-        
-        trend, is_hot, is_cold = get_trend(stats["last_5_avg"], stats["avg_sog"])
-        is_qualified, status_icon = get_status_icon(hit_rate, is_cold)
-        
-        return {
-            "player": stats,
-            "opponent": opp,
-            "opponent_defense": opp_def,
-            "home_away": info["home_away"],
-            "game_time": info["time"],
-            "game_id": info["game_id"],
-            "matchup": info["matchup"],
-            "prob_2plus": round(prob_2 * 100, 1),
-            "prob_3plus": round(prob_3 * 100, 1),
-            "prob_4plus": round(prob_4 * 100, 1),
-            "is_qualified": is_qualified,
-            "status_icon": status_icon,
-            "trend": trend,
-            "is_hot": is_hot,
-            "is_cold": is_cold,
-            "tags": get_tags(stats)
-        }
-    
-    # Process players in parallel batches
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_player = {executor.submit(process_player, p): p for p in all_players}
-        
-        for future in as_completed(future_to_player):
-            completed += 1
-            pct = 30 + int((completed / total) * 70)
-            progress_bar.progress(pct)
+        try:
+            stats = fetch_player_full(player_info)
             
-            elapsed = time.time() - start_time
-            rate = completed / elapsed if elapsed > 0 else 0
-            remaining = (total - completed) / rate if rate > 0 else 0
-            time_display.text(f"⏱️ {elapsed:.0f}s elapsed | ~{remaining:.0f}s remaining")
+            if not stats:
+                continue
             
-            result = future.result()
-            if result:
-                all_plays.append(result)
+            hit_rate = stats["hit_rate_2plus"] if threshold == 2 else stats["hit_rate_3plus"] if threshold == 3 else stats["hit_rate_4plus"]
+            if hit_rate < MIN_HIT_RATE:
+                continue
+            
+            info = game_info.get(player_info["team"])
+            if not info:
+                continue
+            
+            opp = info["opponent"]
+            opp_def = team_defense.get(opp, {"shots_allowed_per_game": 30.0, "grade": "C", "trend": "stable"})
+            is_home = info["home_away"] == "HOME"
+            
+            prob_2 = calculate_model_probability(stats, opp_def, is_home, 2)
+            prob_3 = calculate_model_probability(stats, opp_def, is_home, 3)
+            prob_4 = calculate_model_probability(stats, opp_def, is_home, 4)
+            
+            trend, is_hot, is_cold = get_trend(stats["last_5_avg"], stats["avg_sog"])
+            is_qualified, status_icon = get_status_icon(hit_rate, is_cold)
+            
+            play = {
+                "player": stats,
+                "opponent": opp,
+                "opponent_defense": opp_def,
+                "home_away": info["home_away"],
+                "game_time": info["time"],
+                "game_id": info["game_id"],
+                "matchup": info["matchup"],
+                "prob_2plus": round(prob_2 * 100, 1),
+                "prob_3plus": round(prob_3 * 100, 1),
+                "prob_4plus": round(prob_4 * 100, 1),
+                "is_qualified": is_qualified,
+                "status_icon": status_icon,
+                "trend": trend,
+                "is_hot": is_hot,
+                "is_cold": is_cold,
+                "tags": get_tags(stats)
+            }
+            all_plays.append(play)
+            stats_display.text(f"Checked: {i+1}/{total} | Found: {len(all_plays)}")
+            
+        except Exception as e:
+            continue
     
     progress_bar.progress(100)
     elapsed_total = time.time() - start_time
     status_text.text(f"✅ Complete in {elapsed_total:.1f}s!")
-    time_display.text(f"Found {len(all_plays)} players with {MIN_HIT_RATE}%+ hit rate")
     
     time.sleep(1)
     progress_bar.empty()
     status_text.empty()
-    time_display.empty()
+    stats_display.empty()
     
     # Sort by probability
     prob_key = f"prob_{threshold}plus"
@@ -1007,13 +995,12 @@ def show_help():
     st.header("❓ Help")
     show_model_explanation()
     st.markdown("""
-    ## v3.4 Improvements
+    ## v3.4.1 Improvements
     
     ### ⚡ Speed
-    - **Parallel API calls** - 8 concurrent requests
     - **Reduced defense fetching** - 5 games instead of 10
     - **Smarter caching** - 30 min for defense stats
-    - **~60-70% faster** than v3.3
+    - **Progress tracking** - See exactly what's happening
     
     ### 🧮 Model
     - **Position factor** - Forwards shoot more than D
