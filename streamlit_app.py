@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer v3.1
+NHL Shots on Goal Analyzer v3.3
 ===============================
-Changes from v3:
-- Sorted by hit rate (not confidence)
-- Tooltips on all columns
-- "How It's Calculated" sections explaining all variables
+Changes from v3.2:
+- Player name is first column
+- Status column is just icons (✅/⚠️)
+- Parlay table is clean, with expandable copy sections
 """
 
 import streamlit as st
@@ -23,7 +23,7 @@ import statistics
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="NHL SOG Analyzer v3.1",
+    page_title="NHL SOG Analyzer",
     page_icon="🏒",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -36,6 +36,7 @@ NHL_WEB_API = "https://api-web.nhle.com/v1"
 SEASON = "20242025"
 GAME_TYPE = 2
 MIN_GAMES = 8
+MIN_HIT_RATE = 75
 REQUEST_DELAY = 0.05
 EST = pytz.timezone('US/Eastern')
 
@@ -44,21 +45,19 @@ MATCHUP_GRADES = {
     "C+": 29.0, "C": 28.0, "D": 27.0, "F": 0.0,
 }
 
-# Column definitions for tooltips
-COLUMN_DEFINITIONS = {
-    "Hit%": "Percentage of games this season where player recorded 2+ (or 3+/4+) shots on goal",
-    "Avg": "Season average shots on goal per game",
-    "L5": "Average shots on goal over last 5 games (recent form)",
-    "L10": "Average shots on goal over last 10 games",
-    "Floor": "Minimum SOG in any game this season (0 = has been shut out)",
-    "Ceil": "Maximum SOG in any game this season",
-    "Prob%": "Model-calculated probability of hitting the threshold tonight",
-    "Conf": "Confidence score (0-100) based on multiple factors - see 'How It's Calculated'",
-    "Trend": "🔥 HOT = L5 > Avg + 0.5 | ❄️ COLD = L5 < Avg - 0.5 | ➡️ STEADY = within range",
-    "Matchup": "Opponent defense grade: A+ (allows most shots) to F (allows fewest)",
-    "PP": "Power Play indicator: ⚡PP1 = first unit (2+ min/game), ✓ = some PP time",
-    "Status": "✅ QUALIFIED = 85%+ hit rate & not cold | ⚠️ RISK = 80-84% or cold streak",
-    "Tags": "🛡️ HIGH FLOOR = never 0 SOG | ⚡ PP1 = power play 1 | 🔥 STREAK = 5+ game streak",
+MODEL_WEIGHTS = {
+    "l5_weight": 0.40,
+    "l10_weight": 0.30,
+    "season_weight": 0.30,
+    "hit_rate_90_boost": 1.12,
+    "hit_rate_85_boost": 1.08,
+    "hit_rate_80_boost": 1.04,
+    "pp1_boost": 1.18,
+    "pp2_boost": 1.08,
+    "home_boost": 1.03,
+    "away_penalty": 0.97,
+    "hot_streak_boost": 1.05,
+    "cold_streak_penalty": 0.92,
 }
 
 # ============================================================================
@@ -102,136 +101,91 @@ def get_grade(sa_pg: float) -> str:
             return grade
     return "F"
 
-def get_trend(l5: float, season: float) -> str:
+def get_trend(l5: float, season: float) -> Tuple[str, bool, bool]:
     diff = l5 - season
     if diff >= 0.5:
-        return "🔥 HOT"
+        return "🔥", True, False
     elif diff <= -0.5:
-        return "❄️ COLD"
-    return "➡️ STEADY"
+        return "❄️", False, True
+    return "➡️", False, False
 
-def is_cold(l5: float, season: float) -> bool:
-    return (l5 - season) <= -0.5
-
-def get_tags(player: Dict) -> List[str]:
+def get_tags(player: Dict) -> str:
     tags = []
     if player["floor"] >= 1:
-        tags.append("🛡️ HIGH FLOOR")
+        tags.append("🛡️")
     if player["is_pp1"]:
-        tags.append("⚡ PP1")
+        tags.append("⚡")
     elif player["pp_toi"] > 0.5:
         tags.append("PP")
     if player["current_streak"] >= 5:
-        tags.append(f"🔥 {player['current_streak']}G STREAK")
-    return tags
+        tags.append(f"🔥{player['current_streak']}G")
+    return " ".join(tags)
 
-def get_qualification_status(player: Dict, threshold: int = 2) -> Tuple[bool, str]:
-    hit_rate = player["hit_rate_2plus"] if threshold == 2 else player["hit_rate_3plus"] if threshold == 3 else player["hit_rate_4plus"]
-    cold = is_cold(player["last_5_avg"], player["avg_sog"])
-    
-    if hit_rate >= 85 and not cold:
-        return True, "✅ QUALIFIED"
-    elif hit_rate >= 80:
-        reasons = []
-        if hit_rate < 85:
-            reasons.append(f"{hit_rate:.0f}%")
-        if cold:
-            reasons.append("cold")
-        return False, f"⚠️ {', '.join(reasons)}"
-    return False, "❌ <80%"
+def get_status_icon(hit_rate: float, is_cold: bool) -> Tuple[bool, str]:
+    """Returns (is_qualified, icon)"""
+    if hit_rate >= 85 and not is_cold:
+        return True, "✅"
+    else:
+        return False, "⚠️"
 
-def calculate_confidence(player: Dict, opp_def: Dict, is_home: bool, threshold: int = 2) -> Tuple[int, Dict[str, int]]:
-    """
-    Calculate confidence score with breakdown of factors.
-    Returns (total_score, breakdown_dict)
-    """
-    breakdown = {}
-    score = 50  # Base score
-    breakdown["Base"] = 50
+def format_parlay_text(legs: List[Dict], threshold: int, parlay_name: str, prob: float, odds: int) -> str:
+    """Format parlay for copy-paste."""
+    text = f"🏒 NHL {parlay_name}\n"
+    text += "─" * 30 + "\n"
+    for p in legs:
+        player = p["player"]
+        hit_rate = player[f"hit_rate_{threshold}plus"]
+        status = "✅" if p["is_qualified"] else "⚠️"
+        text += f"{status} {player['name']} ({player['team']})\n"
+        text += f"   O{threshold-0.5} SOG | {hit_rate:.0f}% hit rate\n"
+    text += "─" * 30 + "\n"
+    text += f"Prob: {prob*100:.0f}% | Odds: {odds:+d}\n"
+    return text
+
+# ============================================================================
+# PROBABILITY MODEL
+# ============================================================================
+def calculate_model_probability(player: Dict, opp_def: Dict, is_home: bool, threshold: int) -> float:
+    base_lambda = (
+        player["last_5_avg"] * MODEL_WEIGHTS["l5_weight"] +
+        player["last_10_avg"] * MODEL_WEIGHTS["l10_weight"] +
+        player["avg_sog"] * MODEL_WEIGHTS["season_weight"]
+    )
     
-    hit_rate = player["hit_rate_2plus"] if threshold == 2 else player["hit_rate_3plus"] if threshold == 3 else player["hit_rate_4plus"]
-    
-    # Hit rate factor (most important)
-    if hit_rate >= 95:
-        hr_score = 30
-    elif hit_rate >= 90:
-        hr_score = 25
+    hit_rate = player[f"hit_rate_{threshold}plus"]
+    if hit_rate >= 90:
+        hr_factor = MODEL_WEIGHTS["hit_rate_90_boost"]
     elif hit_rate >= 85:
-        hr_score = 18
+        hr_factor = MODEL_WEIGHTS["hit_rate_85_boost"]
     elif hit_rate >= 80:
-        hr_score = 10
+        hr_factor = MODEL_WEIGHTS["hit_rate_80_boost"]
     else:
-        hr_score = 0
-    score += hr_score
-    breakdown["Hit Rate"] = hr_score
+        hr_factor = 1.0
     
-    # Form factor (L5 vs season avg)
-    form_diff = player["last_5_avg"] - player["avg_sog"]
-    if form_diff >= 1.0:
-        form_score = 12
-    elif form_diff >= 0.5:
-        form_score = 6
-    elif form_diff <= -1.0:
-        form_score = -12
-    elif form_diff <= -0.5:
-        form_score = -6
-    else:
-        form_score = 0
-    score += form_score
-    breakdown["Recent Form"] = form_score
-    
-    # Floor factor
-    if player["floor"] >= 2:
-        floor_score = 8
-    elif player["floor"] >= 1:
-        floor_score = 4
-    else:
-        floor_score = -4
-    score += floor_score
-    breakdown["Floor"] = floor_score
-    
-    # Matchup factor (reduced weight)
-    grade = opp_def.get("grade", "C")
-    if grade in ["A+", "A"]:
-        matchup_score = 6
-    elif grade == "B+":
-        matchup_score = 3
-    elif grade in ["D", "F"]:
-        matchup_score = -6
-    else:
-        matchup_score = 0
-    score += matchup_score
-    breakdown["Matchup"] = matchup_score
-    
-    # PP factor
     if player["is_pp1"]:
-        pp_score = 6
+        pp_factor = MODEL_WEIGHTS["pp1_boost"]
     elif player["pp_toi"] > 1.0:
-        pp_score = 3
+        pp_factor = MODEL_WEIGHTS["pp2_boost"]
     else:
-        pp_score = 0
-    score += pp_score
-    breakdown["Power Play"] = pp_score
+        pp_factor = 1.0
     
-    # Consistency factor
-    if player["std_dev"] < 1.0:
-        cons_score = 4
-    elif player["std_dev"] > 2.0:
-        cons_score = -4
+    ha_factor = MODEL_WEIGHTS["home_boost"] if is_home else MODEL_WEIGHTS["away_penalty"]
+    
+    opp_sa = opp_def.get("shots_allowed_per_game", 30.0)
+    opp_factor = opp_sa / 30.0
+    
+    trend, is_hot, is_cold = get_trend(player["last_5_avg"], player["avg_sog"])
+    if is_hot:
+        streak_factor = MODEL_WEIGHTS["hot_streak_boost"]
+    elif is_cold:
+        streak_factor = MODEL_WEIGHTS["cold_streak_penalty"]
     else:
-        cons_score = 0
-    score += cons_score
-    breakdown["Consistency"] = cons_score
+        streak_factor = 1.0
     
-    # Home/away
-    if is_home:
-        ha_score = 2
-    else:
-        ha_score = -2
-    score += ha_score
-    breakdown["Home/Away"] = ha_score
+    adj_lambda = base_lambda * hr_factor * pp_factor * ha_factor * opp_factor * streak_factor
+    prob = poisson_prob_at_least(adj_lambda, threshold)
     
-    return max(0, min(100, score)), breakdown
+    return prob
 
 # ============================================================================
 # NHL API FUNCTIONS
@@ -512,17 +466,11 @@ def generate_best_parlay(plays: List[Dict], num_legs: int, threshold: int) -> Op
     if len(plays) < num_legs:
         return None
     
-    # Sort by hit rate (primary sort)
-    hit_key = f"hit_rate_{threshold}plus"
-    sorted_plays = sorted(plays, key=lambda x: x["player"][hit_key], reverse=True)
+    prob_key = f"prob_{threshold}plus"
+    sorted_plays = sorted(plays, key=lambda x: x[prob_key], reverse=True)
     
     best_legs = sorted_plays[:num_legs]
-    
-    probs = []
-    for play in best_legs:
-        prob = play[f"prob_{threshold}plus"] / 100
-        probs.append(prob)
-    
+    probs = [p[prob_key] / 100 for p in best_legs]
     combined_prob, american_odds = calculate_parlay_odds(probs)
     
     return {
@@ -539,129 +487,103 @@ def generate_sgp_for_game(plays: List[Dict], game_id: str, threshold: int, min_l
     if len(game_plays) < min_legs:
         return None
     
-    hit_key = f"hit_rate_{threshold}plus"
-    sorted_plays = sorted(game_plays, key=lambda x: x["player"][hit_key], reverse=True)
+    prob_key = f"prob_{threshold}plus"
+    sorted_plays = sorted(game_plays, key=lambda x: x[prob_key], reverse=True)
     
-    for num_legs in range(min_legs, min(len(sorted_plays) + 1, 8)):
+    for num_legs in range(min_legs, min(len(sorted_plays) + 1, 10)):
         legs = sorted_plays[:num_legs]
-        probs = [p[f"prob_{threshold}plus"] / 100 for p in legs]
+        probs = [p[prob_key] / 100 for p in legs]
         combined_prob, american_odds = calculate_parlay_odds(probs)
         
         if american_odds >= min_odds:
+            qualified_count = sum(1 for p in legs if p["is_qualified"])
+            risky_count = num_legs - qualified_count
+            
             return {
                 "legs": legs,
                 "num_legs": num_legs,
                 "combined_prob": combined_prob,
                 "american_odds": american_odds,
                 "payout_per_100": calculate_parlay_payout(american_odds, 100),
-                "game_id": game_id
+                "game_id": game_id,
+                "qualified_count": qualified_count,
+                "risky_count": risky_count,
+                "risk_level": "🟢" if risky_count == 0 else ("🟡" if risky_count <= 1 else "🔴")
             }
+    
+    if len(sorted_plays) >= min_legs:
+        legs = sorted_plays[:min_legs]
+        probs = [p[prob_key] / 100 for p in legs]
+        combined_prob, american_odds = calculate_parlay_odds(probs)
+        qualified_count = sum(1 for p in legs if p["is_qualified"])
+        risky_count = min_legs - qualified_count
+        
+        return {
+            "legs": legs,
+            "num_legs": min_legs,
+            "combined_prob": combined_prob,
+            "american_odds": american_odds,
+            "payout_per_100": calculate_parlay_payout(american_odds, 100),
+            "game_id": game_id,
+            "qualified_count": qualified_count,
+            "risky_count": risky_count,
+            "risk_level": "⚪" if american_odds < min_odds else ("🟢" if risky_count == 0 else "🔴")
+        }
     
     return None
 
 # ============================================================================
-# UI HELPER - DEFINITIONS EXPANDER
+# UI COMPONENTS
 # ============================================================================
-def show_definitions():
-    """Show expandable definitions section."""
-    with st.expander("📖 Column Definitions & How It's Calculated", expanded=False):
-        
-        st.markdown("### 📊 Column Definitions")
-        
+def show_model_explanation():
+    with st.expander("📖 How It Works", expanded=False):
         col1, col2 = st.columns(2)
         
         with col1:
             st.markdown("""
-            | Column | Definition |
+            ### Model Weights
+            
+            **Base** = L5 (40%) + L10 (30%) + Avg (30%)
+            
+            | Factor | Multiplier |
             |--------|------------|
-            | **Hit%** | % of games hitting threshold this season |
-            | **Avg** | Season average SOG per game |
-            | **L5** | Average SOG last 5 games |
-            | **L10** | Average SOG last 10 games |
-            | **Floor** | Lowest SOG in any game |
-            | **Ceil** | Highest SOG in any game |
+            | Hit Rate 90%+ | ×1.12 |
+            | Hit Rate 85%+ | ×1.08 |
+            | Hit Rate 80%+ | ×1.04 |
+            | PP1 | ×1.18 |
+            | PP2 | ×1.08 |
+            | Home | ×1.03 |
+            | Away | ×0.97 |
+            | 🔥 Hot | ×1.05 |
+            | ❄️ Cold | ×0.92 |
             """)
         
         with col2:
             st.markdown("""
-            | Column | Definition |
-            |--------|------------|
-            | **Prob%** | Model probability for tonight |
-            | **Conf** | Confidence score (0-100) |
-            | **Trend** | 🔥 HOT / ❄️ COLD / ➡️ STEADY |
-            | **Matchup** | Opponent defense grade (A+ to F) |
-            | **Status** | ✅ Qualified / ⚠️ Risk |
+            ### Status Icons
+            
+            | Icon | Meaning |
+            |------|---------|
+            | ✅ | Qualified (85%+, not cold) |
+            | ⚠️ | Higher risk |
+            | 🛡️ | High floor (never 0 SOG) |
+            | ⚡ | PP1 player |
+            | 🔥 | Hot streak |
+            | ❄️ | Cold streak |
+            
+            ### Matchup Grades
+            
+            **A+/A** = Soft defense (good)  
+            **D/F** = Tough defense (bad)
             """)
-        
-        st.markdown("---")
-        st.markdown("### 🧮 How Confidence Score is Calculated")
-        
-        st.markdown("""
-        **Base Score: 50 points**
-        
-        | Factor | Points | Logic |
-        |--------|--------|-------|
-        | **Hit Rate** | -0 to +30 | 95%+ = +30, 90%+ = +25, 85%+ = +18, 80%+ = +10 |
-        | **Recent Form** | -12 to +12 | L5 vs Avg: +1.0 diff = +12, +0.5 = +6, -0.5 = -6, -1.0 = -12 |
-        | **Floor** | -4 to +8 | Floor ≥2 = +8, Floor ≥1 = +4, Floor 0 = -4 |
-        | **Matchup** | -6 to +6 | A+/A = +6, B+ = +3, D/F = -6 |
-        | **Power Play** | 0 to +6 | PP1 (2+ min) = +6, PP time = +3 |
-        | **Consistency** | -4 to +4 | StdDev <1.0 = +4, >2.0 = -4 |
-        | **Home/Away** | -2 to +2 | Home = +2, Away = -2 |
-        
-        **Final Score = Base + All Factors (capped 0-100)**
-        """)
-        
-        st.markdown("---")
-        st.markdown("### 🎯 How Probability is Calculated")
-        
-        st.markdown("""
-        Uses **Poisson distribution** with adjusted lambda (expected SOG):
-        
-        ```
-        Base Lambda = (L5 × 0.4) + (L10 × 0.3) + (Season Avg × 0.3)
-        
-        Adjustments:
-        × Home Factor (1.02 home, 0.98 away)
-        × Opponent Factor (Opp SA/G ÷ 30)
-        × PP Factor (1.15 for PP1, 1.08 for PP time)
-        
-        Final Prob = Poisson P(X ≥ threshold) using adjusted lambda
-        ```
-        """)
-        
-        st.markdown("---")
-        st.markdown("### 🏷️ Tags Explained")
-        
-        st.markdown("""
-        | Tag | Meaning |
-        |-----|---------|
-        | 🛡️ **HIGH FLOOR** | Player has never recorded 0 SOG this season |
-        | ⚡ **PP1** | Averages 2+ minutes on Power Play per game |
-        | 🔥 **X G STREAK** | Has hit 2+ SOG in X consecutive games |
-        """)
-        
-        st.markdown("---")
-        st.markdown("### ✅ Qualification Criteria")
-        
-        st.markdown("""
-        **Qualified** (safest plays):
-        - 85%+ hit rate for selected threshold
-        - NOT in cold streak (L5 not more than 0.5 below season avg)
-        
-        **Higher Risk** (still shown, but flagged):
-        - 80-84% hit rate, OR
-        - Currently in cold streak
-        """)
 
 # ============================================================================
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer v3.1")
-    st.caption("Sorted by Hit Rate | Full Definitions | All Players Shown")
+    st.title("🏒 NHL SOG Analyzer")
+    st.caption("v3.3 | Sorted by Model Probability")
     
-    # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
         
@@ -674,37 +596,23 @@ def main():
         bet_type = st.radio(
             "SOG Threshold:",
             ["Over 1.5 (2+ SOG)", "Over 2.5 (3+ SOG)", "Over 3.5 (4+ SOG)"],
-            index=0,
-            help="The minimum shots on goal to win the bet"
+            index=0
         )
         threshold = 2 if "1.5" in bet_type else 3 if "2.5" in bet_type else 4
         
         st.markdown("---")
         
-        unit_size = st.number_input(
-            "Unit Size ($)", 
-            min_value=1, 
-            max_value=1000, 
-            value=25,
-            help="Your standard bet amount for calculating payouts"
-        )
+        unit_size = st.number_input("Unit Size ($)", min_value=1, max_value=1000, value=25)
         
         st.markdown("---")
         
         run_analysis = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
         
         st.markdown("---")
-        st.caption(f"Time: {get_est_datetime().strftime('%I:%M %p EST')}")
+        st.caption(f"{get_est_datetime().strftime('%I:%M %p EST')}")
     
-    # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 All Results", 
-        "🎯 Best Bets", 
-        "🎰 Parlays",
-        "❓ Help"
-    ])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 All Results", "🎯 Best Bets", "🎰 Parlays", "❓ Help"])
     
-    # Session state
     if 'all_plays' not in st.session_state:
         st.session_state.all_plays = []
     if 'games' not in st.session_state:
@@ -721,10 +629,10 @@ def main():
         elif st.session_state.all_plays:
             display_all_results(st.session_state.all_plays, st.session_state.threshold, date_str)
         else:
-            st.info("👈 Click **Run Analysis** to start")
+            st.info("👈 Click **Run Analysis**")
             games = get_todays_schedule(date_str)
             if games:
-                st.subheader(f"📅 Games on {date_str}")
+                st.subheader(f"📅 {date_str}")
                 for game in games:
                     st.write(f"**{game['away_team']}** @ **{game['home_team']}** - {game['time']}")
     
@@ -744,18 +652,14 @@ def main():
         show_help()
 
 def run_full_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[Dict]]:
-    
-    st.subheader(f"📅 Games on {date_str}")
+    st.subheader(f"📅 {date_str}")
     games = get_todays_schedule(date_str)
     
     if not games:
         st.error("No games found!")
         return [], []
     
-    game_df = pd.DataFrame([
-        {"Away": g["away_team"], "Home": g["home_team"], "Time": g["time"]}
-        for g in games
-    ])
+    game_df = pd.DataFrame([{"Away": g["away_team"], "Home": g["home_team"], "Time": g["time"]} for g in games])
     st.dataframe(game_df, use_container_width=True, hide_index=True)
     
     teams_playing = set()
@@ -764,24 +668,10 @@ def run_full_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[D
     for game in games:
         teams_playing.add(game["away_team"])
         teams_playing.add(game["home_team"])
-        game_info[game["away_team"]] = {
-            "opponent": game["home_team"], 
-            "home_away": "AWAY", 
-            "time": game["time"],
-            "game_id": game["id"],
-            "matchup": game["matchup"]
-        }
-        game_info[game["home_team"]] = {
-            "opponent": game["away_team"], 
-            "home_away": "HOME", 
-            "time": game["time"],
-            "game_id": game["id"],
-            "matchup": game["matchup"]
-        }
+        game_info[game["away_team"]] = {"opponent": game["home_team"], "home_away": "AWAY", "time": game["time"], "game_id": game["id"], "matchup": game["matchup"]}
+        game_info[game["home_team"]] = {"opponent": game["away_team"], "home_away": "HOME", "time": game["time"], "game_id": game["id"], "matchup": game["matchup"]}
     
     st.markdown("---")
-    st.subheader("📊 Progress")
-    
     progress_bar = st.progress(0)
     status_text = st.empty()
     stats_display = st.empty()
@@ -789,7 +679,7 @@ def run_full_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[D
     team_defense = get_team_defense_stats(teams_playing, progress_bar, status_text)
     
     progress_bar.progress(25)
-    status_text.text(f"📋 Fetching rosters...")
+    status_text.text("📋 Fetching rosters...")
     
     all_players = []
     for team in teams_playing:
@@ -817,10 +707,9 @@ def run_full_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[D
             time.sleep(REQUEST_DELAY)
             continue
         
-        # Only filter: 80%+ hit rate
         hit_rate = stats["hit_rate_2plus"] if threshold == 2 else stats["hit_rate_3plus"] if threshold == 3 else stats["hit_rate_4plus"]
         
-        if hit_rate < 80:
+        if hit_rate < MIN_HIT_RATE:
             time.sleep(REQUEST_DELAY)
             continue
         
@@ -832,22 +721,12 @@ def run_full_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[D
         opp_def = team_defense.get(opp, {"shots_allowed_per_game": 30.0, "grade": "C"})
         is_home = info["home_away"] == "HOME"
         
-        # Calculate probability
-        base = (stats["last_5_avg"] * 0.4) + (stats["last_10_avg"] * 0.3) + (stats["avg_sog"] * 0.3)
-        home_factor = 1.02 if is_home else 0.98
-        opp_factor = opp_def["shots_allowed_per_game"] / 30.0
-        pp_factor = 1.15 if stats["is_pp1"] else (1.08 if stats["pp_toi"] > 1.0 else 1.0)
-        adj_lambda = base * home_factor * opp_factor * pp_factor
+        prob_2 = calculate_model_probability(stats, opp_def, is_home, 2)
+        prob_3 = calculate_model_probability(stats, opp_def, is_home, 3)
+        prob_4 = calculate_model_probability(stats, opp_def, is_home, 4)
         
-        prob_2 = poisson_prob_at_least(adj_lambda, 2) * 100
-        prob_3 = poisson_prob_at_least(adj_lambda, 3) * 100
-        prob_4 = poisson_prob_at_least(adj_lambda, 4) * 100
-        
-        # Confidence with breakdown
-        conf, conf_breakdown = calculate_confidence(stats, opp_def, is_home, threshold)
-        
-        # Qualification
-        is_qualified, status = get_qualification_status(stats, threshold)
+        trend, is_hot, is_cold = get_trend(stats["last_5_avg"], stats["avg_sog"])
+        is_qualified, status_icon = get_status_icon(hit_rate, is_cold)
         
         players_found += 1
         
@@ -859,14 +738,14 @@ def run_full_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[D
             "game_time": info["time"],
             "game_id": info["game_id"],
             "matchup": info["matchup"],
-            "prob_2plus": round(prob_2, 1),
-            "prob_3plus": round(prob_3, 1),
-            "prob_4plus": round(prob_4, 1),
-            "confidence": conf,
-            "conf_breakdown": conf_breakdown,
+            "prob_2plus": round(prob_2 * 100, 1),
+            "prob_3plus": round(prob_3 * 100, 1),
+            "prob_4plus": round(prob_4 * 100, 1),
             "is_qualified": is_qualified,
-            "status": status,
-            "trend": get_trend(stats["last_5_avg"], stats["avg_sog"]),
+            "status_icon": status_icon,
+            "trend": trend,
+            "is_hot": is_hot,
+            "is_cold": is_cold,
             "tags": get_tags(stats)
         }
         all_plays.append(play)
@@ -874,105 +753,81 @@ def run_full_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[D
     
     progress_bar.progress(100)
     status_text.text("✅ Complete!")
-    stats_display.text(f"Total: {players_checked} checked, {players_found} with 80%+ hit rate")
+    stats_display.text(f"Total: {players_checked} checked, {players_found} with {MIN_HIT_RATE}%+ hit rate")
     time.sleep(1)
     
     progress_bar.empty()
     status_text.empty()
     stats_display.empty()
     
-    # SORT BY HIT RATE (not confidence)
-    hit_key = f"hit_rate_{threshold}plus"
-    all_plays.sort(key=lambda x: x["player"][hit_key], reverse=True)
+    prob_key = f"prob_{threshold}plus"
+    all_plays.sort(key=lambda x: x[prob_key], reverse=True)
     
-    st.success(f"Found **{len(all_plays)}** players with 80%+ hit rate!")
+    st.success(f"Found **{len(all_plays)}** players with {MIN_HIT_RATE}%+ hit rate!")
     display_all_results(all_plays, threshold, date_str)
     
     return all_plays, games
 
 def display_all_results(plays: List[Dict], threshold: int, date_str: str):
+    st.subheader(f"🎯 All Players - O{threshold - 0.5} SOG")
+    st.caption("Sorted by Model Probability")
     
-    st.subheader(f"🎯 All Players - Over {threshold - 0.5} SOG")
-    st.caption("Sorted by Hit Rate (highest first) | All players with 80%+ shown")
-    
-    # Show definitions
-    show_definitions()
+    show_model_explanation()
     
     hit_key = f"hit_rate_{threshold}plus"
     prob_key = f"prob_{threshold}plus"
     
-    # Summary
     qualified = len([p for p in plays if p["is_qualified"]])
-    high_floor = len([p for p in plays if p["player"]["floor"] >= 1])
     pp1_count = len([p for p in plays if p["player"]["is_pp1"]])
-    hot_count = len([p for p in plays if "HOT" in p["trend"]])
+    hot_count = len([p for p in plays if p["is_hot"]])
     
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total", len(plays), help="All players with 80%+ hit rate")
-    col2.metric("✅ Qualified", qualified, help="85%+ hit rate and not cold")
-    col3.metric("🛡️ High Floor", high_floor, help="Never had 0 SOG this season")
-    col4.metric("⚡ PP1", pp1_count, help="Power Play 1 (2+ min/game)")
-    col5.metric("🔥 Hot", hot_count, help="L5 average above season average")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total", len(plays))
+    col2.metric("✅ Qualified", qualified)
+    col3.metric("⚡ PP1", pp1_count)
+    col4.metric("🔥 Hot", hot_count)
     
-    # Build table
+    # Player name FIRST, status as icon only
     results_data = []
     for play in plays:
         p = play["player"]
-        tags = " ".join(play["tags"]) if play["tags"] else ""
         
         row = {
-            "Status": play["status"],
+            "": play["status_icon"],  # Icon column (no header)
             "Player": p["name"],
-            "Tags": tags,
+            "Tags": play["tags"],
             "Team": p["team"],
             "vs": play["opponent"],
-            "H/A": play["home_away"],
-            "Hit%": f"{p[hit_key]:.1f}%",
+            "Prob%": play[prob_key],
+            "Hit%": p[hit_key],
             "Avg": p["avg_sog"],
             "L5": p["last_5_avg"],
             "Floor": p["floor"],
-            "Ceil": p["ceiling"],
-            "Prob%": f"{play[prob_key]:.1f}%",
-            "Conf": play["confidence"],
             "Trend": play["trend"],
-            "Matchup": play["opponent_defense"]["grade"],
-            "Time": play["game_time"]
+            "Def": play["opponent_defense"]["grade"],
         }
         results_data.append(row)
     
     df = pd.DataFrame(results_data)
     
-    # Display with column config for tooltips
     st.dataframe(
         df, 
         use_container_width=True, 
         hide_index=True,
         column_config={
-            "Status": st.column_config.TextColumn("Status", help=COLUMN_DEFINITIONS["Status"]),
-            "Hit%": st.column_config.TextColumn("Hit%", help=COLUMN_DEFINITIONS["Hit%"]),
-            "Avg": st.column_config.NumberColumn("Avg", help=COLUMN_DEFINITIONS["Avg"]),
-            "L5": st.column_config.NumberColumn("L5", help=COLUMN_DEFINITIONS["L5"]),
-            "Floor": st.column_config.NumberColumn("Floor", help=COLUMN_DEFINITIONS["Floor"]),
-            "Ceil": st.column_config.NumberColumn("Ceil", help=COLUMN_DEFINITIONS["Ceil"]),
-            "Prob%": st.column_config.TextColumn("Prob%", help=COLUMN_DEFINITIONS["Prob%"]),
-            "Conf": st.column_config.ProgressColumn("Conf", min_value=0, max_value=100, help=COLUMN_DEFINITIONS["Conf"]),
-            "Trend": st.column_config.TextColumn("Trend", help=COLUMN_DEFINITIONS["Trend"]),
-            "Matchup": st.column_config.TextColumn("Matchup", help=COLUMN_DEFINITIONS["Matchup"]),
-            "Tags": st.column_config.TextColumn("Tags", help=COLUMN_DEFINITIONS["Tags"]),
+            "": st.column_config.TextColumn("", width="small"),
+            "Player": st.column_config.TextColumn("Player", width="medium"),
+            "Prob%": st.column_config.ProgressColumn("Prob%", min_value=0, max_value=100, format="%.1f%%"),
+            "Hit%": st.column_config.NumberColumn("Hit%", format="%.1f%%"),
         }
     )
     
-    # Download
     csv = df.to_csv(index=False)
-    st.download_button("📥 Download CSV", data=csv, 
-                       file_name=f"nhl_sog_all_{date_str}.csv", mime="text/csv")
+    st.download_button("📥 Download CSV", data=csv, file_name=f"nhl_sog_{date_str}.csv", mime="text/csv")
 
 def show_best_bets(plays: List[Dict], threshold: int):
-    
     st.header("🎯 Best Bets")
-    
-    # Show definitions
-    show_definitions()
+    show_model_explanation()
     
     qualified = [p for p in plays if p["is_qualified"]]
     risky = [p for p in plays if not p["is_qualified"]]
@@ -980,210 +835,196 @@ def show_best_bets(plays: List[Dict], threshold: int):
     hit_key = f"hit_rate_{threshold}plus"
     prob_key = f"prob_{threshold}plus"
     
-    # Qualified section
-    st.subheader(f"✅ Qualified Plays ({len(qualified)})")
-    st.caption("85%+ hit rate AND not in cold streak")
+    st.subheader(f"✅ Qualified ({len(qualified)})")
+    st.caption("85%+ hit rate, not cold")
     
     if qualified:
         qual_data = []
         for play in qualified:
             p = play["player"]
-            tags = " ".join(play["tags"]) if play["tags"] else ""
             qual_data.append({
                 "Player": p["name"],
-                "Tags": tags,
+                "Tags": play["tags"],
                 "Team": p["team"],
                 "vs": play["opponent"],
-                "Hit%": f"{p[hit_key]:.1f}%",
-                "Avg": p["avg_sog"],
+                "Prob%": play[prob_key],
+                "Hit%": p[hit_key],
                 "L5": p["last_5_avg"],
-                "Prob%": f"{play[prob_key]:.1f}%",
-                "Conf": play["confidence"],
                 "Trend": play["trend"],
             })
         st.dataframe(pd.DataFrame(qual_data), use_container_width=True, hide_index=True)
     else:
-        st.warning("No qualified plays. Check Higher Risk section.")
+        st.warning("No qualified plays")
     
     st.markdown("---")
     
-    # Higher risk section
-    st.subheader(f"⚠️ Higher Risk Plays ({len(risky)})")
-    st.caption("80-84% hit rate OR currently in cold streak")
+    st.subheader(f"⚠️ Higher Risk ({len(risky)})")
+    st.caption("75-84% hit rate or cold streak")
     
     if risky:
         risk_data = []
         for play in risky:
             p = play["player"]
-            tags = " ".join(play["tags"]) if play["tags"] else ""
             risk_data.append({
                 "Player": p["name"],
-                "Risk Factor": play["status"].replace("⚠️ ", ""),
-                "Tags": tags,
+                "Tags": play["tags"],
                 "Team": p["team"],
                 "vs": play["opponent"],
-                "Hit%": f"{p[hit_key]:.1f}%",
+                "Prob%": play[prob_key],
+                "Hit%": p[hit_key],
                 "L5": p["last_5_avg"],
-                "Avg": p["avg_sog"],
-                "Prob%": f"{play[prob_key]:.1f}%",
+                "Trend": play["trend"],
             })
         st.dataframe(pd.DataFrame(risk_data), use_container_width=True, hide_index=True)
 
 def show_parlays(plays: List[Dict], games: List[Dict], threshold: int, unit_size: float):
+    st.header("🎰 Parlays")
+    show_model_explanation()
     
-    st.header("🎰 Optimal Parlays")
+    prob_key = f"prob_{threshold}plus"
+    hit_key = f"hit_rate_{threshold}plus"
     
-    # Show definitions
-    show_definitions()
+    sorted_plays = sorted(plays, key=lambda x: x[prob_key], reverse=True)
     
-    qualified = [p for p in plays if p["is_qualified"]]
+    st.success(f"Building from **{len(sorted_plays)}** players")
     
-    if len(qualified) < 2:
-        st.warning("Need 2+ qualified plays for parlays. Using all plays.")
-        qualified = plays
+    # CLEAN PARLAY TABLE
+    st.subheader("📊 Best Parlay by Legs")
     
-    st.success(f"Building parlays from **{len(qualified)}** players (sorted by hit rate)")
+    max_legs = min(12, len(sorted_plays))
     
-    # Best parlay for each leg count
-    st.subheader("📊 Best Parlay by Leg Count")
-    st.caption("Optimal combination for each number of legs")
-    
-    parlay_results = []
-    max_legs = min(12, len(qualified))
+    # Summary table
+    parlay_table = []
+    parlays_dict = {}  # Store for expanders
     
     for num_legs in range(1, max_legs + 1):
-        parlay = generate_best_parlay(qualified, num_legs, threshold)
+        parlay = generate_best_parlay(sorted_plays, num_legs, threshold)
         if parlay:
+            prob_pct = parlay['combined_prob'] * 100
+            odds = parlay['american_odds']
+            payout = parlay['payout_per_100'] * unit_size / 100
             players = ", ".join([p["player"]["name"] for p in parlay["legs"]])
-            parlay_results.append({
+            
+            parlay_table.append({
                 "Legs": num_legs,
-                "Prob": f"{parlay['combined_prob'] * 100:.1f}%",
-                "Odds": f"{parlay['american_odds']:+d}" if parlay['american_odds'] < 10000 else "N/A",
-                f"${unit_size:.0f} Wins": f"${parlay['payout_per_100'] * unit_size / 100:.0f}",
-                "Players": players[:100] + "..." if len(players) > 100 else players
+                "Prob%": f"{prob_pct:.1f}%",
+                "Odds": f"{odds:+d}" if odds < 10000 else "—",
+                f"${unit_size:.0f} Wins": f"${payout:.0f}",
+                "Players": players[:60] + "..." if len(players) > 60 else players
             })
+            parlays_dict[num_legs] = parlay
     
-    if parlay_results:
-        st.dataframe(pd.DataFrame(parlay_results), use_container_width=True, hide_index=True)
+    if parlay_table:
+        st.dataframe(pd.DataFrame(parlay_table), use_container_width=True, hide_index=True)
     
-    # Copyable parlay text for top options
-    st.markdown("### 📋 Copy-Paste Parlays")
+    # EXPANDABLE COPY SECTIONS
+    st.markdown("### 📋 Click to Copy")
     
-    for num_legs in [2, 3, 5]:
-        if num_legs <= len(qualified):
-            parlay = generate_best_parlay(qualified, num_legs, threshold)
-            if parlay:
-                with st.expander(f"**{num_legs}-Leg Parlay** ({parlay['combined_prob']*100:.0f}% | {parlay['american_odds']:+d})"):
-                    copy_text = f"🏒 NHL SOG {num_legs}-Leg Parlay:\n"
-                    for p in parlay["legs"]:
-                        copy_text += f"• {p['player']['name']} O{threshold-0.5} SOG ({p['player'][f'hit_rate_{threshold}plus']:.0f}%)\n"
-                    copy_text += f"\nProb: {parlay['combined_prob']*100:.0f}% | Odds: {parlay['american_odds']:+d}"
+    cols = st.columns(4)
+    for i, num_legs in enumerate([2, 3, 5, 10]):
+        if num_legs in parlays_dict:
+            parlay = parlays_dict[num_legs]
+            with cols[i % 4]:
+                with st.expander(f"**{num_legs}-Leg** ({parlay['combined_prob']*100:.0f}%)"):
+                    copy_text = format_parlay_text(
+                        parlay["legs"], 
+                        threshold, 
+                        f"{num_legs}-Leg Parlay",
+                        parlay['combined_prob'],
+                        parlay['american_odds']
+                    )
                     st.code(copy_text, language=None)
     
     st.markdown("---")
     
-    # Ultimate parlay
-    st.subheader("🏆 Ultimate Parlay (Max Legs)")
+    # ULTIMATE PARLAY
+    st.subheader("🏆 Ultimate Parlay")
     
-    ultimate_legs = min(20, len(qualified))
-    ultimate = generate_best_parlay(qualified, ultimate_legs, threshold)
+    ultimate_legs = min(20, len(sorted_plays))
+    ultimate = generate_best_parlay(sorted_plays, ultimate_legs, threshold)
     
     if ultimate:
         col1, col2, col3 = st.columns(3)
         col1.metric("Legs", ultimate["num_legs"])
         col2.metric("Prob", f"{ultimate['combined_prob'] * 100:.2f}%")
-        col3.metric("Odds", f"{ultimate['american_odds']:+d}" if ultimate['american_odds'] < 100000 else "Long shot!")
+        col3.metric("Odds", f"{ultimate['american_odds']:+d}" if ultimate['american_odds'] < 100000 else "Long shot")
         
-        ult_data = [{
-            "Player": p["player"]["name"],
-            "Team": p["player"]["team"],
-            "Hit%": f"{p['player'][f'hit_rate_{threshold}plus']:.1f}%"
-        } for p in ultimate["legs"]]
-        st.dataframe(pd.DataFrame(ult_data), use_container_width=True, hide_index=True)
+        with st.expander("📋 View Players & Copy"):
+            ult_data = [{"Player": p["player"]["name"], "Team": p["player"]["team"], "Prob%": f"{p[prob_key]:.0f}%"} for p in ultimate["legs"]]
+            st.dataframe(pd.DataFrame(ult_data), use_container_width=True, hide_index=True)
+            
+            copy_text = format_parlay_text(ultimate["legs"], threshold, f"Ultimate {ultimate['num_legs']}-Leg", ultimate['combined_prob'], ultimate['american_odds'])
+            st.code(copy_text, language=None)
     
     st.markdown("---")
     
     # SGPs
-    st.subheader("🎮 Single Game Parlays (SGP)")
-    st.caption("For profit boosts: 3+ legs, same game, +300 minimum")
+    st.subheader("🎮 Single Game Parlays")
+    st.caption("For profit boosts | 3+ legs | +300 target")
     
-    sgp_found = False
     for game in games:
-        sgp = generate_sgp_for_game(qualified, game["id"], threshold, min_legs=3, min_odds=300)
+        sgp = generate_sgp_for_game(sorted_plays, game["id"], threshold, min_legs=3, min_odds=300)
         
         if sgp:
-            sgp_found = True
-            st.markdown(f"### {game['matchup']} ({game['time']})")
+            risk_text = f"{sgp['risk_level']} {sgp['qualified_count']}✅ {sgp['risky_count']}⚠️"
+            odds_text = f"{sgp['american_odds']:+d}"
             
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Legs", sgp["num_legs"])
-            col2.metric("Prob", f"{sgp['combined_prob'] * 100:.1f}%")
-            col3.metric("Odds", f"+{sgp['american_odds']}")
-            col4.metric(f"${unit_size:.0f} Wins", f"${sgp['payout_per_100'] * unit_size / 100:.0f}")
-            
-            sgp_data = [{
-                "Player": p["player"]["name"],
-                "Team": p["player"]["team"],
-                "Hit%": f"{p['player'][f'hit_rate_{threshold}plus']:.1f}%"
-            } for p in sgp["legs"]]
-            st.dataframe(pd.DataFrame(sgp_data), use_container_width=True, hide_index=True)
-            
-            sgp_text = f"🎮 SGP - {game['matchup']}:\n"
-            for p in sgp["legs"]:
-                sgp_text += f"• {p['player']['name']} O{threshold-0.5} SOG\n"
-            sgp_text += f"Odds: +{sgp['american_odds']} | Use profit boost!"
-            st.code(sgp_text, language=None)
-            st.markdown("---")
-    
-    if not sgp_found:
-        st.info("No SGPs with 3+ qualified players at +300 odds.")
-        
-        # Try all plays
-        st.markdown("### SGPs Including Higher Risk Players")
-        for game in games:
-            sgp = generate_sgp_for_game(plays, game["id"], threshold, min_legs=3, min_odds=300)
-            if sgp:
-                st.markdown(f"**{game['matchup']}** ⚠️")
+            with st.expander(f"**{game['matchup']}** | {odds_text} | {risk_text}"):
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Legs", sgp["num_legs"])
+                col2.metric("Prob", f"{sgp['combined_prob'] * 100:.1f}%")
+                col3.metric("Odds", odds_text)
+                col4.metric(f"${unit_size:.0f} Wins", f"${sgp['payout_per_100'] * unit_size / 100:.0f}")
+                
                 sgp_data = [{
+                    "": "✅" if p["is_qualified"] else "⚠️",
                     "Player": p["player"]["name"],
-                    "Hit%": f"{p['player'][f'hit_rate_{threshold}plus']:.1f}%",
-                    "Status": "✅" if p["is_qualified"] else "⚠️"
+                    "Prob%": f"{p[prob_key]:.0f}%",
+                    "Hit%": f"{p['player'][hit_key]:.0f}%",
                 } for p in sgp["legs"]]
                 st.dataframe(pd.DataFrame(sgp_data), use_container_width=True, hide_index=True)
+                
+                copy_text = f"🎮 SGP - {game['matchup']}\n"
+                copy_text += "─" * 30 + "\n"
+                for p in sgp["legs"]:
+                    status = "✅" if p["is_qualified"] else "⚠️"
+                    copy_text += f"{status} {p['player']['name']} O{threshold-0.5} SOG\n"
+                copy_text += "─" * 30 + "\n"
+                copy_text += f"Odds: {sgp['american_odds']:+d} | Risk: {sgp['risk_level']}\n"
+                st.code(copy_text, language=None)
 
 def show_help():
     st.header("❓ Help")
-    
-    # Full definitions
-    show_definitions()
+    show_model_explanation()
     
     st.markdown("""
     ## Quick Start
     
-    1. **Run Analysis** - Fetches all players with 80%+ hit rate
-    2. **All Results** - See everyone, sorted by hit rate
-    3. **Best Bets** - Qualified (safest) vs Higher Risk
-    4. **Parlays** - Best combo for each leg count + SGPs
+    1. **Run Analysis** → Fetches players with 75%+ hit rate
+    2. **All Results** → Everyone sorted by model probability  
+    3. **Best Bets** → ✅ Qualified vs ⚠️ Higher Risk
+    4. **Parlays** → Best combos + SGPs for profit boosts
     
-    ## What Should I Bet?
+    ## Status Icons
     
-    | Risk Level | What to Pick |
-    |------------|--------------|
-    | **Safest** | 2-leg parlay of top Qualified players |
-    | **Moderate** | 3-leg parlay of Qualified players |
-    | **Aggressive** | 5+ leg parlay |
-    | **Lottery** | Ultimate parlay (all legs) |
-    | **Profit Boost** | SGP with +300 odds |
+    | Icon | Meaning |
+    |------|---------|
+    | ✅ | Qualified (85%+, not cold) |
+    | ⚠️ | Higher risk (75-84% or cold) |
     
-    ## Why Hit Rate > Confidence?
+    ## Risk Levels (SGPs)
     
-    **Hit rate is historical fact.** If a player has hit 2+ SOG in 90% of games, that's real data.
+    | Level | Meaning |
+    |-------|---------|
+    | 🟢 | All qualified players |
+    | 🟡 | 1 risky player |
+    | 🔴 | 2+ risky players |
+    | ⚪ | Below +300 odds |
     
-    **Confidence is a model estimate.** It tries to predict tonight, but it's just math.
+    ## Copying Parlays
     
-    For parlays, prioritize high hit rate players because:
-    - More consistent = fewer busted legs
-    - Historical performance > model predictions
+    Click the expander for any parlay to see the formatted text.
+    Select all and copy to share!
     """)
 
 if __name__ == "__main__":
