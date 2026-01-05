@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer - Cloud Version
-==========================================
-Streamlit Cloud deployment for NHL SOG betting analysis.
-No local storage - runs entirely in browser.
+NHL Shots on Goal Analyzer - Cloud Version v2
+==============================================
+Fixed: Caching issues, added detailed progress tracking
 """
 
 import streamlit as st
@@ -35,7 +34,7 @@ NHL_WEB_API = "https://api-web.nhle.com/v1"
 SEASON = "20242025"
 GAME_TYPE = 2
 MIN_GAMES = 10
-REQUEST_DELAY = 0.08
+REQUEST_DELAY = 0.05
 EST = pytz.timezone('US/Eastern')
 
 MATCHUP_GRADES = {
@@ -52,88 +51,46 @@ PARLAY_CONFIG = {
 }
 
 # ============================================================================
-# DATA CLASSES
+# SIMPLE DATA STORAGE (no dataclasses for caching compatibility)
 # ============================================================================
-@dataclass
-class TeamDefense:
-    team_abbrev: str
-    team_name: str
-    games_played: int
-    shots_allowed_per_game: float
-    shots_allowed_L5: float
-    pk_shots_allowed: float
-    rank: int = 0
-    grade: str = ""
-    recent_trend: str = ""
+def make_team_defense(abbrev, name, gp, sa_pg, sa_l5, pk_sa, rank=0, grade="", trend=""):
+    return {
+        "team_abbrev": abbrev,
+        "team_name": name,
+        "games_played": gp,
+        "shots_allowed_per_game": sa_pg,
+        "shots_allowed_L5": sa_l5,
+        "pk_shots_allowed": pk_sa,
+        "rank": rank,
+        "grade": grade,
+        "recent_trend": trend
+    }
 
-@dataclass 
-class PlayerStats:
-    player_id: int
-    name: str
-    team: str
-    position: str
-    games_played: int
-    hit_rate_2plus: float
-    hit_rate_3plus: float
-    hit_rate_4plus: float
-    avg_sog: float
-    last_5_avg: float
-    last_10_avg: float
-    std_dev: float
-    floor: int
-    ceiling: int
-    current_streak: int
-    home_avg: float
-    away_avg: float
-    pp_toi: float = 0.0
-    is_pp1: bool = False
-    all_shots: List[int] = field(default_factory=list)
-    opponents: List[str] = field(default_factory=list)
-
-@dataclass
-class BettingPlay:
-    player: PlayerStats
-    opponent: str
-    opponent_defense: TeamDefense
-    home_away: str
-    game_time: str
-    game_id: str
-    h2h_avg: float
-    h2h_games: int
-    prob_2plus: float
-    prob_3plus: float
-    prob_4plus: float
-    confidence: float
-    tier: str
-    trend: str
-    implied_odds: int
-    edge_factors: List[str] = field(default_factory=list)
-    risk_factors: List[str] = field(default_factory=list)
-
-@dataclass
-class ParlayLeg:
-    player_name: str
-    team: str
-    opponent: str
-    threshold: float
-    our_prob: float
-    confidence: int
-    tier: str
-    game_id: str
-    is_pp1: bool
-    trend: str
-
-@dataclass
-class Parlay:
-    legs: List[ParlayLeg]
-    combined_prob: float
-    combined_odds: int
-    expected_payout: float
-    unit_size: float
-    category: str
-    correlation_score: float
-    correlation_notes: List[str]
-    risk_level: str
+def make_player_stats(player_id, name, team, position, gp, hit2, hit3, hit4, avg, l5, l10, 
+                      std, floor, ceiling, streak, home, away, pp_toi, is_pp1, shots, opps):
+    return {
+        "player_id": player_id,
+        "name": name,
+        "team": team,
+        "position": position,
+        "games_played": gp,
+        "hit_rate_2plus": hit2,
+        "hit_rate_3plus": hit3,
+        "hit_rate_4plus": hit4,
+        "avg_sog": avg,
+        "last_5_avg": l5,
+        "last_10_avg": l10,
+        "std_dev": std,
+        "floor": floor,
+        "ceiling": ceiling,
+        "current_streak": streak,
+        "home_avg": home,
+        "away_avg": away,
+        "pp_toi": pp_toi,
+        "is_pp1": is_pp1,
+        "all_shots": shots,
+        "opponents": opps
+    }
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -198,14 +155,14 @@ def get_tier(confidence: float, hit_rate: float) -> str:
         return "⚠️ RISKY"
     return "❌ AVOID"
 
-def detect_correlation(leg1: ParlayLeg, leg2: ParlayLeg) -> Tuple[float, str]:
-    if leg1.team == leg2.team:
-        if leg1.is_pp1 and leg2.is_pp1:
-            return (0.3, f"Same team PP1 ({leg1.team})")
-        return (0.15, f"Teammates ({leg1.team})")
-    if leg1.opponent == leg2.team or leg2.opponent == leg1.team:
+def detect_correlation(leg1: Dict, leg2: Dict) -> Tuple[float, str]:
+    if leg1["team"] == leg2["team"]:
+        if leg1["is_pp1"] and leg2["is_pp1"]:
+            return (0.3, f"Same team PP1 ({leg1['team']})")
+        return (0.15, f"Teammates ({leg1['team']})")
+    if leg1["opponent"] == leg2["team"] or leg2["opponent"] == leg1["team"]:
         return (-0.1, f"Opponents")
-    if leg1.game_id == leg2.game_id:
+    if leg1["game_id"] == leg2["game_id"]:
         return (0.05, f"Same game")
     return (0.0, "Independent")
 
@@ -311,14 +268,19 @@ def get_player_advanced_stats(player_id: int) -> Dict:
     except:
         return {"pp_toi_per_game": 0}
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_team_defense_stats_cached() -> Dict[str, TeamDefense]:
-    """Fetch all team defense stats with caching."""
-    all_teams = get_all_teams()
+def get_team_defense_stats(teams_playing: set, progress_bar, status_text) -> Dict[str, Dict]:
+    """Fetch defense stats for teams playing today only (faster)."""
     team_defense = {}
+    all_teams = get_all_teams()
     
-    for team in all_teams:
+    # Filter to only teams we need
+    teams_to_fetch = [t for t in all_teams if t["abbrev"] in teams_playing]
+    total_teams = len(teams_to_fetch)
+    
+    for i, team in enumerate(teams_to_fetch):
         abbrev = team["abbrev"]
+        status_text.text(f"📊 Fetching defense stats: {abbrev} ({i+1}/{total_teams})")
+        progress_bar.progress(int((i / total_teams) * 30))
         
         try:
             url = f"{NHL_WEB_API}/club-schedule-season/{abbrev}/{SEASON}"
@@ -330,15 +292,13 @@ def get_team_defense_stats_cached() -> Dict[str, TeamDefense]:
                         if g.get("gameType") == GAME_TYPE and g.get("gameState") == "OFF"]
             
             if not completed:
-                team_defense[abbrev] = TeamDefense(
-                    team_abbrev=abbrev, team_name=team["name"],
-                    games_played=0, shots_allowed_per_game=30.0,
-                    shots_allowed_L5=30.0, pk_shots_allowed=8.0,
-                    grade="C", recent_trend="➡️ STABLE"
+                team_defense[abbrev] = make_team_defense(
+                    abbrev, team["name"], 0, 30.0, 30.0, 8.0, 0, "C", "➡️ STABLE"
                 )
                 continue
             
-            recent = completed[-20:]
+            # Only fetch last 10 games for speed
+            recent = completed[-10:]
             recent_5 = completed[-5:] if len(completed) >= 5 else completed
             
             sa_all = []
@@ -387,34 +347,22 @@ def get_team_defense_stats_cached() -> Dict[str, TeamDefense]:
             else:
                 trend = "➡️ STABLE"
             
-            team_defense[abbrev] = TeamDefense(
-                team_abbrev=abbrev,
-                team_name=team["name"],
-                games_played=len(sa_all),
-                shots_allowed_per_game=round(sa_pg, 2),
-                shots_allowed_L5=round(sa_L5_avg, 2),
-                pk_shots_allowed=round(sa_pg * 0.25, 2),
-                grade=get_grade(sa_pg),
-                recent_trend=trend
+            team_defense[abbrev] = make_team_defense(
+                abbrev, team["name"], len(sa_all),
+                round(sa_pg, 2), round(sa_L5_avg, 2), round(sa_pg * 0.25, 2),
+                0, get_grade(sa_pg), trend
             )
             
-        except:
-            team_defense[abbrev] = TeamDefense(
-                team_abbrev=abbrev, team_name=team["name"],
-                games_played=0, shots_allowed_per_game=30.0,
-                shots_allowed_L5=30.0, pk_shots_allowed=8.0,
-                grade="C", recent_trend="➡️ STABLE"
+        except Exception as e:
+            team_defense[abbrev] = make_team_defense(
+                abbrev, team["name"], 0, 30.0, 30.0, 8.0, 0, "C", "➡️ STABLE"
             )
         
         time.sleep(REQUEST_DELAY)
     
-    sorted_teams = sorted(team_defense.values(), key=lambda x: x.shots_allowed_per_game, reverse=True)
-    for rank, team in enumerate(sorted_teams, 1):
-        team_defense[team.team_abbrev].rank = rank
-    
     return team_defense
 
-def get_player_stats(player_id: int, name: str, team: str, position: str) -> Optional[PlayerStats]:
+def get_player_stats(player_id: int, name: str, team: str, position: str) -> Optional[Dict]:
     url = f"{NHL_WEB_API}/player/{player_id}/game-log/{SEASON}/{GAME_TYPE}"
     
     try:
@@ -474,25 +422,13 @@ def get_player_stats(player_id: int, name: str, team: str, position: str) -> Opt
         pp_toi = adv_stats.get("pp_toi_per_game", 0)
         is_pp1 = pp_toi >= 2.0
         
-        return PlayerStats(
-            player_id=player_id, name=name, team=team, position=position,
-            games_played=gp,
-            hit_rate_2plus=round(hit_2, 1),
-            hit_rate_3plus=round(hit_3, 1),
-            hit_rate_4plus=round(hit_4, 1),
-            avg_sog=round(avg, 2),
-            last_5_avg=round(l5_avg, 2),
-            last_10_avg=round(l10_avg, 2),
-            std_dev=round(std, 2),
-            floor=min(all_shots),
-            ceiling=max(all_shots),
-            current_streak=streak,
-            home_avg=round(home_avg, 2),
-            away_avg=round(away_avg, 2),
-            pp_toi=pp_toi,
-            is_pp1=is_pp1,
-            all_shots=all_shots,
-            opponents=opponents
+        return make_player_stats(
+            player_id, name, team, position, gp,
+            round(hit_2, 1), round(hit_3, 1), round(hit_4, 1),
+            round(avg, 2), round(l5_avg, 2), round(l10_avg, 2),
+            round(std, 2), min(all_shots), max(all_shots), streak,
+            round(home_avg, 2), round(away_avg, 2),
+            pp_toi, is_pp1, all_shots, opponents
         )
     except:
         return None
@@ -500,36 +436,36 @@ def get_player_stats(player_id: int, name: str, team: str, position: str) -> Opt
 # ============================================================================
 # ANALYSIS FUNCTIONS
 # ============================================================================
-def calculate_adjusted_lambda(player: PlayerStats, opp_def: TeamDefense, is_home: bool) -> float:
-    base = (player.last_5_avg * 0.4) + (player.last_10_avg * 0.3) + (player.avg_sog * 0.3)
+def calculate_adjusted_lambda(player: Dict, opp_def: Dict, is_home: bool) -> float:
+    base = (player["last_5_avg"] * 0.4) + (player["last_10_avg"] * 0.3) + (player["avg_sog"] * 0.3)
     
-    if is_home and player.home_avg > 0:
-        home_factor = player.home_avg / player.avg_sog if player.avg_sog > 0 else 1.0
-    elif not is_home and player.away_avg > 0:
-        home_factor = player.away_avg / player.avg_sog if player.avg_sog > 0 else 1.0
+    if is_home and player["home_avg"] > 0:
+        home_factor = player["home_avg"] / player["avg_sog"] if player["avg_sog"] > 0 else 1.0
+    elif not is_home and player["away_avg"] > 0:
+        home_factor = player["away_avg"] / player["avg_sog"] if player["avg_sog"] > 0 else 1.0
     else:
         home_factor = 1.02 if is_home else 0.98
     
-    opp_factor = opp_def.shots_allowed_per_game / 30.0 if opp_def.shots_allowed_per_game > 0 else 1.0
+    opp_factor = opp_def["shots_allowed_per_game"] / 30.0 if opp_def["shots_allowed_per_game"] > 0 else 1.0
     
-    if opp_def.shots_allowed_L5 > 0:
-        recent_factor = opp_def.shots_allowed_L5 / 30.0
+    if opp_def["shots_allowed_L5"] > 0:
+        recent_factor = opp_def["shots_allowed_L5"] / 30.0
         opp_factor = (opp_factor * 0.6) + (recent_factor * 0.4)
     
     pp_factor = 1.0
-    if player.is_pp1:
+    if player["is_pp1"]:
         pp_factor = 1.15
-    elif player.pp_toi > 1.0:
+    elif player["pp_toi"] > 1.0:
         pp_factor = 1.08
     
     return base * home_factor * opp_factor * pp_factor
 
-def calculate_confidence(player: PlayerStats, opp: TeamDefense, is_home: bool, threshold: int = 2) -> Tuple[float, List[str], List[str]]:
+def calculate_confidence(player: Dict, opp: Dict, is_home: bool, threshold: int = 2) -> Tuple[float, List[str], List[str]]:
     edges = []
     risks = []
     score = 50
     
-    hit_rate = player.hit_rate_2plus if threshold == 2 else player.hit_rate_3plus if threshold == 3 else player.hit_rate_4plus
+    hit_rate = player["hit_rate_2plus"] if threshold == 2 else player["hit_rate_3plus"] if threshold == 3 else player["hit_rate_4plus"]
     
     if hit_rate >= 90:
         score += 25
@@ -545,58 +481,58 @@ def calculate_confidence(player: PlayerStats, opp: TeamDefense, is_home: bool, t
         score -= 15
         risks.append(f"Low {hit_rate}% hit rate")
     
-    form_diff = player.last_5_avg - player.avg_sog
+    form_diff = player["last_5_avg"] - player["avg_sog"]
     if form_diff >= 1.0:
         score += 15
-        edges.append(f"🔥 Hot streak (L5: {player.last_5_avg})")
+        edges.append(f"🔥 Hot streak (L5: {player['last_5_avg']})")
     elif form_diff >= 0.5:
         score += 10
     elif form_diff <= -1.0:
         score -= 15
-        risks.append(f"❄️ Cold streak (L5: {player.last_5_avg})")
+        risks.append(f"❄️ Cold streak (L5: {player['last_5_avg']})")
     elif form_diff <= -0.5:
         score -= 10
     
-    if opp.grade in ["A+", "A"]:
+    if opp["grade"] in ["A+", "A"]:
         score += 15
-        edges.append(f"Soft matchup ({opp.team_abbrev}: {opp.shots_allowed_per_game} SA/G)")
-    elif opp.grade == "B+":
+        edges.append(f"Soft matchup ({opp['team_abbrev']}: {opp['shots_allowed_per_game']} SA/G)")
+    elif opp["grade"] == "B+":
         score += 8
-    elif opp.grade in ["D", "F"]:
+    elif opp["grade"] in ["D", "F"]:
         score -= 15
-        risks.append(f"Tough matchup ({opp.team_abbrev}: {opp.shots_allowed_per_game} SA/G)")
+        risks.append(f"Tough matchup ({opp['team_abbrev']}: {opp['shots_allowed_per_game']} SA/G)")
     
-    if "LOOSENING" in opp.recent_trend:
+    if "LOOSENING" in opp["recent_trend"]:
         score += 8
-        edges.append(f"Defense loosening (L5: {opp.shots_allowed_L5})")
-    elif "TIGHTENING" in opp.recent_trend:
+        edges.append(f"Defense loosening (L5: {opp['shots_allowed_L5']})")
+    elif "TIGHTENING" in opp["recent_trend"]:
         score -= 8
         risks.append("Defense tightening")
     
-    if player.is_pp1:
+    if player["is_pp1"]:
         score += 10
-        edges.append(f"⚡ PP1 ({player.pp_toi:.1f} min/g)")
-    elif player.pp_toi > 1.0:
+        edges.append(f"⚡ PP1 ({player['pp_toi']:.1f} min/g)")
+    elif player["pp_toi"] > 1.0:
         score += 5
     
-    if player.std_dev < 1.0:
+    if player["std_dev"] < 1.0:
         score += 8
-        edges.append(f"Very consistent (σ={player.std_dev})")
-    elif player.std_dev > 2.0:
+        edges.append(f"Very consistent (σ={player['std_dev']})")
+    elif player["std_dev"] > 2.0:
         score -= 8
-        risks.append(f"High variance (σ={player.std_dev})")
+        risks.append(f"High variance (σ={player['std_dev']})")
     
-    if player.floor >= threshold:
+    if player["floor"] >= threshold:
         score += 8
-        edges.append(f"Floor of {player.floor} SOG")
-    elif player.floor == 0:
+        edges.append(f"Floor of {player['floor']} SOG")
+    elif player["floor"] == 0:
         score -= 5
         risks.append("Has 0 SOG games")
     
-    if is_home and player.home_avg > player.away_avg + 0.3:
+    if is_home and player["home_avg"] > player["away_avg"] + 0.3:
         score += 5
-        edges.append(f"Home boost ({player.home_avg} vs {player.away_avg})")
-    elif not is_home and player.away_avg < player.home_avg - 0.3:
+        edges.append(f"Home boost ({player['home_avg']} vs {player['away_avg']})")
+    elif not is_home and player["away_avg"] < player["home_avg"] - 0.3:
         score -= 5
         risks.append("Road penalty")
     
@@ -605,37 +541,37 @@ def calculate_confidence(player: PlayerStats, opp: TeamDefense, is_home: bool, t
 # ============================================================================
 # PARLAY BUILDER
 # ============================================================================
-def build_parlay_legs(plays: List[BettingPlay], threshold: int) -> List[ParlayLeg]:
+def build_parlay_legs(plays: List[Dict], threshold: int) -> List[Dict]:
     legs = []
     for play in plays:
-        prob = play.prob_2plus / 100 if threshold == 2 else play.prob_3plus / 100 if threshold == 3 else play.prob_4plus / 100
+        prob = play["prob_2plus"] / 100 if threshold == 2 else play["prob_3plus"] / 100 if threshold == 3 else play["prob_4plus"] / 100
         
-        legs.append(ParlayLeg(
-            player_name=play.player.name,
-            team=play.player.team,
-            opponent=play.opponent,
-            threshold=threshold - 0.5,
-            our_prob=prob,
-            confidence=int(play.confidence),
-            tier=play.tier,
-            game_id=play.game_id,
-            is_pp1=play.player.is_pp1,
-            trend=play.trend
-        ))
+        legs.append({
+            "player_name": play["player"]["name"],
+            "team": play["player"]["team"],
+            "opponent": play["opponent"],
+            "threshold": threshold - 0.5,
+            "our_prob": prob,
+            "confidence": int(play["confidence"]),
+            "tier": play["tier"],
+            "game_id": play["game_id"],
+            "is_pp1": play["player"]["is_pp1"],
+            "trend": play["trend"]
+        })
     
     return legs
 
-def generate_parlays(legs: List[ParlayLeg], num_legs: int, max_parlays: int = 10) -> List[Parlay]:
+def generate_parlays(legs: List[Dict], num_legs: int, max_parlays: int = 10) -> List[Dict]:
     if len(legs) < num_legs:
         return []
     
-    sorted_legs = sorted(legs, key=lambda x: (x.confidence, x.our_prob), reverse=True)
-    candidates = sorted_legs[:min(len(sorted_legs), 20)]
+    sorted_legs = sorted(legs, key=lambda x: (x["confidence"], x["our_prob"]), reverse=True)
+    candidates = sorted_legs[:min(len(sorted_legs), 15)]
     all_combos = list(combinations(candidates, num_legs))
     
     parlays = []
-    for combo in all_combos[:500]:
-        probs = [leg.our_prob for leg in combo]
+    for combo in all_combos[:200]:
+        probs = [leg["our_prob"] for leg in combo]
         combined_prob, combined_odds = calculate_parlay_odds(probs)
         
         total_corr = 0
@@ -652,7 +588,7 @@ def generate_parlays(legs: List[ParlayLeg], num_legs: int, max_parlays: int = 10
         adjusted_prob = max(0.01, min(0.99, adjusted_prob))
         
         tier_scores = {"🔒 LOCK": 4, "✅ STRONG": 3, "📊 SOLID": 2, "⚠️ RISKY": 1, "❌ AVOID": 0}
-        avg_tier = sum(tier_scores.get(leg.tier, 0) for leg in combo) / num_legs
+        avg_tier = sum(tier_scores.get(leg["tier"], 0) for leg in combo) / num_legs
         
         if avg_tier >= 3.5:
             risk_level = "LOW"
@@ -663,23 +599,23 @@ def generate_parlays(legs: List[ParlayLeg], num_legs: int, max_parlays: int = 10
         
         config = PARLAY_CONFIG.get(num_legs, PARLAY_CONFIG[5])
         
-        parlay = Parlay(
-            legs=list(combo),
-            combined_prob=adjusted_prob,
-            combined_odds=combined_odds,
-            expected_payout=calculate_parlay_payout(combined_odds),
-            unit_size=config["unit_size"],
-            category=config["name"],
-            correlation_score=avg_corr,
-            correlation_notes=corr_notes[:3],
-            risk_level=risk_level
-        )
+        parlay = {
+            "legs": list(combo),
+            "combined_prob": adjusted_prob,
+            "combined_odds": combined_odds,
+            "expected_payout": calculate_parlay_payout(combined_odds),
+            "unit_size": config["unit_size"],
+            "category": config["name"],
+            "correlation_score": avg_corr,
+            "correlation_notes": corr_notes[:3],
+            "risk_level": risk_level
+        }
         parlays.append(parlay)
     
-    parlays.sort(key=lambda x: x.combined_prob, reverse=True)
+    parlays.sort(key=lambda x: x["combined_prob"], reverse=True)
     return parlays[:max_parlays]
 
-def get_best_parlays_by_category(legs: List[ParlayLeg]) -> Dict[str, List[Parlay]]:
+def get_best_parlays_by_category(legs: List[Dict]) -> Dict[str, List[Dict]]:
     return {
         "Power Pairs (2-leg)": generate_parlays(legs, 2, 5),
         "Triple Threats (3-leg)": generate_parlays(legs, 3, 5),
@@ -731,10 +667,9 @@ def main():
         st.caption(f"Current: {get_est_datetime().strftime('%I:%M %p EST')}")
     
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3 = st.tabs([
         "📊 All Results", 
         "🎯 Best Bets & Parlays", 
-        "🛡️ Team Defense", 
         "❓ Help"
     ])
     
@@ -768,13 +703,10 @@ def main():
             st.info("Run analysis first to see betting strategy")
     
     with tab3:
-        show_defense_rankings()
-    
-    with tab4:
         show_help()
 
 def run_full_analysis(date_str: str, threshold: int, min_hit_rate: float, 
-                     min_confidence: float, pp_only: bool) -> List[BettingPlay]:
+                     min_confidence: float, pp_only: bool) -> List[Dict]:
     
     st.subheader(f"📅 Games on {date_str}")
     games = get_todays_schedule(date_str)
@@ -808,35 +740,48 @@ def run_full_analysis(date_str: str, threshold: int, min_hit_rate: float,
             "game_id": game["id"]
         }
     
-    st.subheader("📊 Fetching Data...")
+    st.markdown("---")
+    st.subheader("📊 Analysis Progress")
     
-    # Progress tracking
+    # Progress elements
     progress_bar = st.progress(0)
     status_text = st.empty()
+    stats_container = st.empty()
+    
+    # Counters for live stats
+    players_checked = 0
+    players_qualified = 0
     
     # Fetch defense stats
-    status_text.text("Fetching team defense stats (this may take a few minutes on first run)...")
-    progress_bar.progress(10)
-    team_defense = get_team_defense_stats_cached()
-    progress_bar.progress(50)
+    status_text.text(f"🛡️ Fetching defense stats for {len(teams_playing)} teams...")
+    team_defense = get_team_defense_stats(teams_playing, progress_bar, status_text)
     
     # Fetch rosters
-    status_text.text("Fetching rosters...")
+    progress_bar.progress(30)
+    status_text.text(f"📋 Fetching rosters for {len(teams_playing)} teams...")
+    
     all_players = []
     for team in teams_playing:
         roster = get_team_roster(team)
         all_players.extend(roster)
         time.sleep(REQUEST_DELAY)
     
-    progress_bar.progress(60)
+    progress_bar.progress(35)
+    status_text.text(f"👥 Found {len(all_players)} players to analyze")
+    time.sleep(0.5)
     
     # Analyze players
     betting_plays = []
     total = len(all_players)
     
     for i, player in enumerate(all_players):
-        status_text.text(f"Analyzing {player['name']}... ({i+1}/{total})")
-        progress_bar.progress(60 + int((i / total) * 40))
+        players_checked += 1
+        
+        # Update progress
+        pct = 35 + int((i / total) * 65)
+        progress_bar.progress(pct)
+        status_text.text(f"🔍 Analyzing: {player['name']} ({player['team']})")
+        stats_container.text(f"✅ Checked: {players_checked}/{total} | 🎯 Qualified: {players_qualified}")
         
         stats = get_player_stats(player["id"], player["name"], player["team"], player["position"])
         
@@ -844,10 +789,10 @@ def run_full_analysis(date_str: str, threshold: int, min_hit_rate: float,
             time.sleep(REQUEST_DELAY)
             continue
         
-        if pp_only and not stats.is_pp1 and stats.pp_toi < 1.0:
+        if pp_only and not stats["is_pp1"] and stats["pp_toi"] < 1.0:
             continue
         
-        hit_rate = stats.hit_rate_2plus if threshold == 2 else stats.hit_rate_3plus if threshold == 3 else stats.hit_rate_4plus
+        hit_rate = stats["hit_rate_2plus"] if threshold == 2 else stats["hit_rate_3plus"] if threshold == 3 else stats["hit_rate_4plus"]
         if hit_rate < min_hit_rate:
             time.sleep(REQUEST_DELAY)
             continue
@@ -864,7 +809,7 @@ def run_full_analysis(date_str: str, threshold: int, min_hit_rate: float,
         is_home = info["home_away"] == "HOME"
         
         # H2H
-        h2h_shots = [stats.all_shots[i] for i, o in enumerate(stats.opponents) if o == opp]
+        h2h_shots = [stats["all_shots"][j] for j, o in enumerate(stats["opponents"]) if o == opp]
         h2h_avg = sum(h2h_shots) / len(h2h_shots) if h2h_shots else 0
         h2h_games = len(h2h_shots)
         
@@ -884,51 +829,59 @@ def run_full_analysis(date_str: str, threshold: int, min_hit_rate: float,
         main_prob = prob_2 if threshold == 2 else prob_3 if threshold == 3 else prob_4
         implied_odds = implied_prob_to_american(main_prob)
         
-        play = BettingPlay(
-            player=stats,
-            opponent=opp,
-            opponent_defense=opp_def,
-            home_away=info["home_away"],
-            game_time=info["time"],
-            game_id=info["game_id"],
-            h2h_avg=round(h2h_avg, 2),
-            h2h_games=h2h_games,
-            prob_2plus=round(prob_2 * 100, 1),
-            prob_3plus=round(prob_3 * 100, 1),
-            prob_4plus=round(prob_4 * 100, 1),
-            confidence=conf,
-            tier=get_tier(conf, hit_rate),
-            trend=get_trend_emoji(stats.last_5_avg, stats.avg_sog),
-            implied_odds=implied_odds,
-            edge_factors=edges,
-            risk_factors=risks
-        )
+        players_qualified += 1
+        
+        play = {
+            "player": stats,
+            "opponent": opp,
+            "opponent_defense": opp_def,
+            "home_away": info["home_away"],
+            "game_time": info["time"],
+            "game_id": info["game_id"],
+            "h2h_avg": round(h2h_avg, 2),
+            "h2h_games": h2h_games,
+            "prob_2plus": round(prob_2 * 100, 1),
+            "prob_3plus": round(prob_3 * 100, 1),
+            "prob_4plus": round(prob_4 * 100, 1),
+            "confidence": conf,
+            "tier": get_tier(conf, hit_rate),
+            "trend": get_trend_emoji(stats["last_5_avg"], stats["avg_sog"]),
+            "implied_odds": implied_odds,
+            "edge_factors": edges,
+            "risk_factors": risks
+        }
         betting_plays.append(play)
         time.sleep(REQUEST_DELAY)
     
     progress_bar.progress(100)
-    status_text.text("Analysis complete!")
-    time.sleep(0.5)
+    status_text.text("✅ Analysis complete!")
+    stats_container.text(f"📊 Final: {players_checked} players checked, {players_qualified} qualified")
+    time.sleep(1)
+    
+    # Clear progress elements
     progress_bar.empty()
     status_text.empty()
+    stats_container.empty()
     
     if not betting_plays:
-        st.warning("No qualifying plays found with current filters!")
+        st.warning("No qualifying plays found with current filters! Try lowering the minimum hit rate or confidence.")
         return []
     
-    betting_plays.sort(key=lambda x: x.confidence, reverse=True)
+    betting_plays.sort(key=lambda x: x["confidence"], reverse=True)
+    
+    st.success(f"🎯 Found {len(betting_plays)} qualifying plays!")
     display_all_results(betting_plays, threshold, date_str)
     
     return betting_plays
 
-def display_all_results(plays: List[BettingPlay], threshold: int, date_str: str):
+def display_all_results(plays: List[Dict], threshold: int, date_str: str):
     st.subheader(f"🎯 All Plays - Over {threshold - 0.5} SOG")
     
     col1, col2, col3, col4, col5 = st.columns(5)
-    locks = len([p for p in plays if "LOCK" in p.tier])
-    strong = len([p for p in plays if "STRONG" in p.tier])
-    solid = len([p for p in plays if "SOLID" in p.tier])
-    pp_players = len([p for p in plays if p.player.is_pp1])
+    locks = len([p for p in plays if "LOCK" in p["tier"]])
+    strong = len([p for p in plays if "STRONG" in p["tier"]])
+    solid = len([p for p in plays if "SOLID" in p["tier"]])
+    pp_players = len([p for p in plays if p["player"]["is_pp1"]])
     
     col1.metric("🔒 Locks", locks)
     col2.metric("✅ Strong", strong)
@@ -938,26 +891,26 @@ def display_all_results(plays: List[BettingPlay], threshold: int, date_str: str)
     
     results_data = []
     for play in plays:
-        p = play.player
-        hit_rate = p.hit_rate_2plus if threshold == 2 else p.hit_rate_3plus if threshold == 3 else p.hit_rate_4plus
-        prob = play.prob_2plus if threshold == 2 else play.prob_3plus if threshold == 3 else play.prob_4plus
+        p = play["player"]
+        hit_rate = p["hit_rate_2plus"] if threshold == 2 else p["hit_rate_3plus"] if threshold == 3 else p["hit_rate_4plus"]
+        prob = play["prob_2plus"] if threshold == 2 else play["prob_3plus"] if threshold == 3 else play["prob_4plus"]
         
         row = {
-            "Tier": play.tier,
-            "Player": p.name,
-            "Team": p.team,
-            "Pos": p.position,
-            "vs": play.opponent,
-            "H/A": play.home_away,
+            "Tier": play["tier"],
+            "Player": p["name"],
+            "Team": p["team"],
+            "Pos": p["position"],
+            "vs": play["opponent"],
+            "H/A": play["home_away"],
             "Hit%": f"{hit_rate:.1f}%",
-            "Avg": p.avg_sog,
-            "L5": p.last_5_avg,
-            "Floor": p.floor,
-            "PP": "⚡" if p.is_pp1 else ("✓" if p.pp_toi > 1 else ""),
+            "Avg": p["avg_sog"],
+            "L5": p["last_5_avg"],
+            "Floor": p["floor"],
+            "PP": "⚡" if p["is_pp1"] else ("✓" if p["pp_toi"] > 1 else ""),
             "Prob%": f"{prob:.1f}%",
-            "Conf": int(play.confidence),
-            "Trend": play.trend,
-            "Matchup": play.opponent_defense.grade,
+            "Conf": int(play["confidence"]),
+            "Trend": play["trend"],
+            "Matchup": play["opponent_defense"]["grade"],
         }
         results_data.append(row)
     
@@ -980,11 +933,11 @@ def display_all_results(plays: List[BettingPlay], threshold: int, date_str: str)
         mime="text/csv"
     )
 
-def show_betting_strategy(plays: List[BettingPlay], threshold: int, unit_size: float, date_str: str):
+def show_betting_strategy(plays: List[Dict], threshold: int, unit_size: float, date_str: str):
     st.header("🎯 Betting Strategy")
     
     legs = build_parlay_legs(plays, threshold)
-    quality_legs = [l for l in legs if l.confidence >= 60 and l.our_prob >= 0.75]
+    quality_legs = [l for l in legs if l["confidence"] >= 60 and l["our_prob"] >= 0.75]
     
     if not quality_legs:
         st.warning("Not enough high-quality plays. Try lowering filters.")
@@ -1018,59 +971,30 @@ def show_betting_strategy(plays: List[BettingPlay], threshold: int, unit_size: f
         st.markdown(f"### {category}")
         
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Probability", f"{best.combined_prob * 100:.1f}%")
-        col2.metric("Odds", f"{best.combined_odds:+d}")
-        col3.metric("Bet", f"${unit_size * best.unit_size:.0f}")
-        col4.metric("To Win", f"${best.expected_payout * unit_size * best.unit_size / 100:.0f}")
+        col1.metric("Probability", f"{best['combined_prob'] * 100:.1f}%")
+        col2.metric("Odds", f"{best['combined_odds']:+d}")
+        col3.metric("Bet", f"${unit_size * best['unit_size']:.0f}")
+        col4.metric("To Win", f"${best['expected_payout'] * unit_size * best['unit_size'] / 100:.0f}")
         
         leg_data = [{
-            "Player": leg.player_name,
-            "Team": leg.team,
-            "Line": f"O{leg.threshold} SOG",
-            "Prob": f"{leg.our_prob * 100:.0f}%",
-            "Conf": leg.confidence,
-            "PP1": "⚡" if leg.is_pp1 else ""
-        } for leg in best.legs]
+            "Player": leg["player_name"],
+            "Team": leg["team"],
+            "Line": f"O{leg['threshold']} SOG",
+            "Prob": f"{leg['our_prob'] * 100:.0f}%",
+            "Conf": leg["confidence"],
+            "PP1": "⚡" if leg["is_pp1"] else ""
+        } for leg in best["legs"]]
         
         st.dataframe(pd.DataFrame(leg_data), hide_index=True, use_container_width=True)
         
         # Copy-paste format
         copy_text = f"NHL SOG Parlay ({category}):\n"
-        for leg in best.legs:
-            copy_text += f"• {leg.player_name} O{leg.threshold} SOG\n"
-        copy_text += f"Combined: {best.combined_prob*100:.0f}% | Odds: {best.combined_odds:+d}"
+        for leg in best["legs"]:
+            copy_text += f"• {leg['player_name']} O{leg['threshold']} SOG\n"
+        copy_text += f"Combined: {best['combined_prob']*100:.0f}% | Odds: {best['combined_odds']:+d}"
         
         st.code(copy_text, language=None)
         st.markdown("---")
-
-def show_defense_rankings():
-    st.subheader("🛡️ Team Defense Rankings")
-    st.caption("Teams allowing most shots = best matchups for overs")
-    
-    if st.button("🔄 Load Defense Stats"):
-        with st.spinner("Fetching (this takes a few minutes on first load)..."):
-            team_defense = get_team_defense_stats_cached()
-            
-            sorted_def = sorted(team_defense.values(), key=lambda x: x.shots_allowed_per_game, reverse=True)
-            
-            data = []
-            for i, t in enumerate(sorted_def, 1):
-                matchup = "🟢 EASY" if t.grade in ["A+", "A"] else (
-                    "🟡 SOFT" if t.grade == "B+" else (
-                    "⚪ AVG" if t.grade in ["B", "C+"] else (
-                    "🟠 TOUGH" if t.grade in ["C", "D"] else "🔴 HARD")))
-                
-                data.append({
-                    "Rank": i,
-                    "Team": t.team_abbrev,
-                    "SA/G": t.shots_allowed_per_game,
-                    "L5": t.shots_allowed_L5,
-                    "Grade": t.grade,
-                    "Trend": t.recent_trend,
-                    "Matchup": matchup
-                })
-            
-            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
 
 def show_help():
     st.header("❓ Help")
@@ -1078,7 +1002,7 @@ def show_help():
     st.markdown("""
     ### Quick Start
     1. Select date and threshold (Over 1.5 is most common)
-    2. Click **Run Analysis** (takes 3-5 minutes)
+    2. Click **Run Analysis** (takes 2-4 minutes)
     3. Check **All Results** for full data
     4. Go to **Best Bets & Parlays** for recommended plays
     
@@ -1098,6 +1022,14 @@ def show_help():
     - **Conf**: Overall confidence score (0-100)
     - **PP1**: ⚡ = Power Play Unit 1 (more ice time)
     - **Matchup**: Opponent defense grade (A+ = allows most shots)
+    
+    ### What to Bet
+    
+    | Priority | Parlay | Unit Size |
+    |----------|--------|-----------|
+    | 1st | Power Pair (2-leg) | 1.0x your unit |
+    | 2nd | Triple Threat (3-leg) | 1.0x your unit |
+    | 3rd | High Five (5-leg) | 0.5x your unit |
     
     ### Parlay Strategy
     
