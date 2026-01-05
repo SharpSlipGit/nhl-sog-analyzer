@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal - ULTIMATE ANALYZER V5.1
-==========================================
-NEW IN V5.1 (Rate-Based Revolution):
-- TOI (Time on Ice) tracking from NHL API
-- SOG per 60 minutes (the key rate metric)
-- SOG per shift  
-- Average shifts per game
-- Average shift length
-- Shutout rate (0 SOG games) - the real risk metric
-- Cushion rate (threshold + 1)
-- Recent shutout detection (L5/L10)
-- Probability caps for high-risk players
-- Enhanced variance penalties
-- TOI trend detection (role changes)
+NHL Shots on Goal Analyzer V6
+=============================
+COMPREHENSIVE MERGE: v4.2 features + v5.1 rate metrics
 
-Based on Day 1 analysis - addresses overconfidence issues.
+FEATURES:
+- Results tracking with historical storage
+- TOI, SOG/60, shifts metrics (from v5.1)
+- Shutout rate, cushion rate (from v5.1)  
+- Parlay Score system (from v4.2)
+- Fetch Results with game status
+- Win rate tracking over time
+- Three tabs: All Results | Tiered Breakdown | Parlays
+- Parlay sizes 1-12 and MAX
+- Optimized fetching with progress display
 
-Usage: streamlit run nhl_sog_ultimate_v5_1.py
+v6.0 - January 2026
 """
 
 import streamlit as st
@@ -27,10 +25,9 @@ import math
 import json
 import os
 import pandas as pd
-from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any
 from datetime import datetime, timedelta
-from itertools import combinations
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
 import statistics
 
@@ -38,7 +35,7 @@ import statistics
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="NHL SOG Ultimate V5.1",
+    page_title="NHL SOG Analyzer V6",
     page_icon="🏒",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -50,312 +47,144 @@ st.set_page_config(
 NHL_WEB_API = "https://api-web.nhle.com/v1"
 SEASON = "20242025"
 GAME_TYPE = 2
-MIN_GAMES = 10
-REQUEST_DELAY = 0.08
+MIN_GAMES = 8
+MIN_HIT_RATE = 75
 EST = pytz.timezone('US/Eastern')
+DATA_DIR = "nhl_sog_data"
+HISTORY_FILE = f"{DATA_DIR}/results_history.json"
 
-# Matchup grades - teams that ALLOW these shots/game
+# Defense grades (SA/G thresholds)
 MATCHUP_GRADES = {
-    "A+": 33.0, "A": 32.0, "B+": 31.0, "B": 30.0,
-    "C+": 29.0, "C": 28.0, "D": 27.0, "F": 0.0,
+    "A+": 34.0, "A": 32.0, "B": 30.0, "C": 28.0, "D": 26.0, "F": 0.0
 }
 
-# Parlay config
-PARLAY_CONFIG = {
-    2: {"name": "Power Pair", "unit_size": 1.0, "expected_hit": 70},
-    3: {"name": "Triple Threat", "unit_size": 1.0, "expected_hit": 55},
-    4: {"name": "Four Banger", "unit_size": 0.75, "expected_hit": 45},
-    5: {"name": "High Five", "unit_size": 0.5, "expected_hit": 35},
-}
-
-# V5.1: Probability caps
+# Probability caps to prevent overconfidence
 PROB_CAPS = {
     "max_absolute": 94.0,
     "high_shutout": 82.0,      # shutout_rate > 8%
     "high_variance": 85.0,     # std_dev > 2.0
     "recent_shutout": 80.0,    # shutout in L5
-    "toi_dropping": 85.0,      # TOI down >15%
+    "toi_dropping": 85.0,      # TOI trending down
     "small_sample": 88.0,      # <20 games
 }
 
 # ============================================================================
-# DATA CLASSES
+# DATA PERSISTENCE
 # ============================================================================
-@dataclass
-class TeamDefense:
-    team_abbrev: str
-    team_name: str
-    games_played: int
-    shots_allowed_per_game: float
-    shots_allowed_L5: float
-    pk_shots_allowed: float
-    rank: int = 0
-    grade: str = ""
-    recent_trend: str = ""
+def ensure_data_dir():
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
 
-@dataclass 
-class PlayerStats:
-    """V5.1 Enhanced with TOI and rate-based metrics."""
-    player_id: int
-    name: str
-    team: str
-    position: str
-    games_played: int
-    
-    # Hit rates
-    hit_rate_2plus: float
-    hit_rate_3plus: float
-    hit_rate_4plus: float
-    
-    # Volume metrics
-    avg_sog: float
-    last_5_avg: float
-    last_10_avg: float
-    std_dev: float
-    floor: int
-    ceiling: int
-    current_streak: int
-    
-    # Home/away
-    home_avg: float
-    away_avg: float
-    
-    # Power play
-    pp_toi: float = 0.0
-    is_pp1: bool = False
-    
-    # Raw data
-    all_shots: List[int] = field(default_factory=list)
-    opponents: List[str] = field(default_factory=list)
-    
-    # =========================================
-    # V5.1 NEW: Time on Ice metrics
-    # =========================================
-    avg_toi: float = 0.0              # Average TOI in minutes
-    l5_toi: float = 0.0               # L5 average TOI
-    l10_toi: float = 0.0              # L10 average TOI
-    toi_trend: str = ""               # "📈 UP", "📉 DOWN", "➡️ STABLE"
-    all_toi: List[float] = field(default_factory=list)
-    
-    # =========================================
-    # V5.1 NEW: Rate-based metrics (THE KEY STUFF)
-    # =========================================
-    sog_per_60: float = 0.0           # Shots per 60 minutes
-    l5_sog_per_60: float = 0.0        # L5 shots per 60
-    l10_sog_per_60: float = 0.0       # L10 shots per 60
-    
-    # =========================================
-    # V5.1 NEW: Shift metrics
-    # =========================================
-    avg_shifts: float = 0.0           # Average shifts per game
-    l5_shifts: float = 0.0            # L5 average shifts
-    sog_per_shift: float = 0.0        # Shots per shift
-    avg_shift_length: float = 0.0     # Average shift length in seconds
-    all_shifts: List[int] = field(default_factory=list)
-    
-    # =========================================
-    # V5.1 NEW: Risk metrics
-    # =========================================
-    shutout_rate: float = 0.0         # % of games with 0 SOG
-    cushion_rate_2: float = 0.0       # % with 3+ SOG (cushion for O1.5)
-    cushion_rate_3: float = 0.0       # % with 4+ SOG (cushion for O2.5)
-    cushion_rate_4: float = 0.0       # % with 5+ SOG (cushion for O3.5)
-    l10_shutouts: int = 0
-    l5_shutouts: int = 0
-    percentile_10: int = 0            # 10th percentile SOG
-    percentile_25: int = 0            # 25th percentile SOG
+def load_history() -> Dict:
+    ensure_data_dir()
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
 
-@dataclass
-class BettingPlay:
-    player: PlayerStats
-    opponent: str
-    opponent_defense: TeamDefense
-    home_away: str
-    game_time: str
-    game_id: str
-    h2h_avg: float
-    h2h_games: int
-    prob_2plus: float
-    prob_3plus: float
-    prob_4plus: float
-    confidence: float
-    tier: str
-    trend: str
-    implied_odds: int
-    edge_factors: List[str] = field(default_factory=list)
-    risk_factors: List[str] = field(default_factory=list)
-    prob_capped: bool = False
-    cap_reason: str = ""
-    projected_toi: float = 0.0
-    projected_sog_rate: float = 0.0
+def save_history(history: Dict):
+    ensure_data_dir()
+    with open(HISTORY_FILE, 'w') as f:
+        json.dump(history, f, indent=2)
 
-@dataclass
-class ParlayLeg:
-    player_name: str
-    team: str
-    opponent: str
-    threshold: float
-    our_prob: float
-    confidence: int
-    tier: str
-    game_id: str
-    is_pp1: bool
-
-@dataclass
-class Parlay:
-    legs: List[ParlayLeg]
-    combined_prob: float
-    combined_odds: int
-    unit_size: float
-    category: str
-    risk_level: str
+# ============================================================================
+# SESSION STATE INIT
+# ============================================================================
+if 'plays' not in st.session_state:
+    st.session_state.plays = []
+if 'games' not in st.session_state:
+    st.session_state.games = []
+if 'saved_picks' not in st.session_state:
+    st.session_state.saved_picks = {}
+if 'results_history' not in st.session_state:
+    st.session_state.results_history = load_history()
 
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
-def get_est_date():
-    return datetime.now(EST).strftime("%Y-%m-%d")
-
 def get_est_datetime():
     return datetime.now(EST)
 
+def get_est_date():
+    return get_est_datetime().strftime("%Y-%m-%d")
+
 def parse_toi(toi_str: str) -> float:
-    """Parse TOI string (MM:SS) to minutes as float."""
+    """Parse TOI string (MM:SS) to minutes."""
     try:
         if not toi_str or toi_str == "0:00":
             return 0.0
         parts = toi_str.split(":")
-        minutes = int(parts[0])
-        seconds = int(parts[1]) if len(parts) > 1 else 0
-        return minutes + seconds / 60.0
+        return int(parts[0]) + int(parts[1]) / 60.0 if len(parts) > 1 else float(parts[0])
     except:
         return 0.0
 
 def implied_prob_to_american(prob: float) -> int:
-    if prob <= 0:
-        return 10000
-    if prob >= 1:
-        return -10000
-    if prob >= 0.5:
-        return int(-100 * prob / (1 - prob))
-    else:
-        return int(100 * (1 - prob) / prob)
+    if prob <= 0: return 10000
+    if prob >= 1: return -10000
+    if prob >= 0.5: return int(-100 * prob / (1 - prob))
+    return int(100 * (1 - prob) / prob)
 
 def poisson_prob_at_least(lam: float, k: int) -> float:
-    if lam <= 0:
-        return 0.0
-    prob_less = sum((math.exp(-lam) * (lam ** i)) / math.factorial(i) for i in range(k))
-    return 1 - prob_less
+    if lam <= 0: return 0.0
+    return 1 - sum((math.exp(-lam) * (lam ** i)) / math.factorial(i) for i in range(k))
 
 def get_grade(sa_pg: float) -> str:
     for grade, threshold in MATCHUP_GRADES.items():
-        if sa_pg >= threshold:
-            return grade
+        if sa_pg >= threshold: return grade
     return "F"
 
-def get_trend_emoji(l5: float, season: float) -> str:
+def get_trend(l5: float, season: float) -> Tuple[str, bool, bool]:
     diff = l5 - season
-    if diff >= 0.5:
-        return "🔥 HOT"
-    elif diff <= -0.5:
-        return "❄️ COLD"
-    return "➡️ STEADY"
+    if diff >= 0.5: return "🔥", True, False
+    if diff <= -0.5: return "❄️", False, True
+    return "➡️", False, False
 
 def get_toi_trend(l5_toi: float, avg_toi: float) -> str:
-    """Determine if player's ice time is trending."""
-    if avg_toi == 0:
-        return "❓"
-    pct_change = (l5_toi - avg_toi) / avg_toi * 100
-    if pct_change >= 8:
-        return "📈 UP"
-    elif pct_change <= -8:
-        return "📉 DOWN"
-    return "➡️ STABLE"
+    if avg_toi == 0: return "❓"
+    pct = (l5_toi - avg_toi) / avg_toi * 100
+    if pct >= 8: return "📈"
+    elif pct <= -8: return "📉"
+    return "➡️"
 
-def calculate_percentile(data: List[int], percentile: int) -> int:
-    if not data:
-        return 0
-    sorted_data = sorted(data)
-    idx = int(len(sorted_data) * percentile / 100)
-    idx = max(0, min(idx, len(sorted_data) - 1))
-    return sorted_data[idx]
+def calculate_percentile(data: List[int], pct: int) -> int:
+    if not data: return 0
+    s = sorted(data)
+    idx = max(0, min(int(len(s) * pct / 100), len(s) - 1))
+    return s[idx]
 
 def calculate_parlay_odds(probs: List[float]) -> Tuple[float, int]:
-    combined_prob = 1.0
-    for p in probs:
-        combined_prob *= p
-    american_odds = implied_prob_to_american(combined_prob)
-    return combined_prob, american_odds
+    combined = 1.0
+    for p in probs: combined *= p
+    return combined, implied_prob_to_american(combined)
 
 def calculate_parlay_payout(odds: int, stake: float = 100) -> float:
-    if odds > 0:
-        return stake + (stake * odds / 100)
-    else:
-        return stake + (stake * 100 / abs(odds))
+    if odds > 0: return stake + (stake * odds / 100)
+    return stake + (stake * 100 / abs(odds))
 
-# ============================================================================
-# V5.1: PROBABILITY CAPPING
-# ============================================================================
-def apply_probability_cap(raw_prob: float, player: PlayerStats) -> Tuple[float, bool, str]:
-    """Cap probabilities based on risk factors."""
-    max_prob = PROB_CAPS["max_absolute"]
-    reasons = []
-    
-    if player.shutout_rate > 8:
-        max_prob = min(max_prob, PROB_CAPS["high_shutout"])
-        reasons.append(f"shutout={player.shutout_rate:.0f}%")
-    
-    if player.std_dev > 2.0:
-        max_prob = min(max_prob, PROB_CAPS["high_variance"])
-        reasons.append(f"σ={player.std_dev:.1f}")
-    
-    if player.l5_shutouts >= 1:
-        max_prob = min(max_prob, PROB_CAPS["recent_shutout"])
-        reasons.append(f"L5_shutout")
-    
-    if player.avg_toi > 0 and player.l5_toi < player.avg_toi * 0.85:
-        max_prob = min(max_prob, PROB_CAPS["toi_dropping"])
-        reasons.append(f"TOI↓")
-    
-    if player.games_played < 20:
-        max_prob = min(max_prob, PROB_CAPS["small_sample"])
-        reasons.append(f"n={player.games_played}")
-    
-    if raw_prob > max_prob:
-        return max_prob, True, ", ".join(reasons)
-    
-    return raw_prob, False, ""
+# Score color based on parlay score
+def get_score_color(score: int) -> str:
+    if score >= 85: return "🟢"
+    if score >= 75: return "🔵"
+    if score >= 65: return "🟡"
+    if score >= 55: return "🟠"
+    return "🔴"
 
-# ============================================================================
-# V5.1: TIER SYSTEM
-# ============================================================================
-def get_tier(confidence: float, hit_rate: float, player: PlayerStats) -> str:
-    """Enhanced tier with consistency requirements."""
-    # LOCK: Exceptional consistency
-    if (confidence >= 75 and 
-        hit_rate >= 85 and 
-        player.shutout_rate <= 5 and
-        player.std_dev <= 1.5 and
-        player.l5_shutouts == 0):
-        return "🔒 LOCK"
-    
-    # STRONG: Good consistency
-    elif (confidence >= 65 and 
-          hit_rate >= 80 and
-          player.shutout_rate <= 10 and
-          player.l5_shutouts <= 1):
-        return "✅ STRONG"
-    
-    # SOLID: Baseline
-    elif (confidence >= 55 and 
-          hit_rate >= 75 and
-          player.shutout_rate <= 15):
-        return "📊 SOLID"
-    
-    # RISKY
-    elif confidence >= 45:
-        return "⚠️ RISKY"
-    
+def get_grade_from_score(score: int) -> str:
+    if score >= 85: return "A+"
+    if score >= 75: return "A"
+    if score >= 65: return "B+"
+    if score >= 55: return "B"
+    if score >= 45: return "C"
+    return "D"
+
+def get_tier_from_score(score: int) -> str:
+    if score >= 80: return "🔒 LOCK"
+    if score >= 70: return "✅ STRONG"
+    if score >= 60: return "📊 SOLID"
+    if score >= 50: return "⚠️ RISKY"
     return "❌ AVOID"
 
 # ============================================================================
@@ -370,9 +199,9 @@ def get_todays_schedule(date_str: str) -> List[Dict]:
         data = resp.json()
         
         games = []
-        for game_week in data.get("gameWeek", []):
-            if game_week.get("date") == date_str:
-                for game in game_week.get("games", []):
+        for gw in data.get("gameWeek", []):
+            if gw.get("date") == date_str:
+                for game in gw.get("games", []):
                     away = game.get("awayTeam", {}).get("abbrev", "")
                     home = game.get("homeTeam", {}).get("abbrev", "")
                     game_id = str(game.get("id", ""))
@@ -382,232 +211,139 @@ def get_todays_schedule(date_str: str) -> List[Dict]:
                     
                     try:
                         utc_dt = datetime.fromisoformat(game.get("startTimeUTC", "").replace("Z", "+00:00"))
-                        est_dt = utc_dt.astimezone(EST)
-                        time_str = est_dt.strftime("%I:%M %p")
+                        time_str = utc_dt.astimezone(EST).strftime("%I:%M %p")
                     except:
                         time_str = "TBD"
                     
-                    games.append({
-                        "id": game_id,
-                        "time": time_str,
-                        "away_team": away,
-                        "home_team": home,
-                    })
+                    games.append({"id": game_id, "time": time_str, "away_team": away, "home_team": home})
         return games
     except Exception as e:
-        st.error(f"Error fetching schedule: {e}")
         return []
 
-@st.cache_data(ttl=600)
-def get_all_teams() -> List[Dict]:
-    url = f"{NHL_WEB_API}/standings/now"
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        return [{"abbrev": t.get("teamAbbrev", {}).get("default", ""),
-                 "name": t.get("teamName", {}).get("default", "")} 
-                for t in data.get("standings", [])]
-    except:
-        return []
-
+@st.cache_data(ttl=1800)
 def get_team_roster(team_abbrev: str) -> List[Dict]:
     url = f"{NHL_WEB_API}/roster/{team_abbrev}/current"
     try:
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        data = resp.json()
         players = []
-        for category in ["forwards", "defensemen"]:
-            for player in data.get(category, []):
-                first = player.get('firstName', {}).get('default', '')
-                last = player.get('lastName', {}).get('default', '')
-                if first and last and player.get("id"):
-                    players.append({
-                        "id": player.get("id"),
-                        "name": f"{first} {last}",
-                        "position": player.get("positionCode", ""),
-                        "team": team_abbrev
-                    })
+        for cat in ["forwards", "defensemen"]:
+            for p in resp.json().get(cat, []):
+                first = p.get('firstName', {}).get('default', '')
+                last = p.get('lastName', {}).get('default', '')
+                if first and last and p.get("id"):
+                    players.append({"id": p["id"], "name": f"{first} {last}", "position": p.get("positionCode", ""), "team": team_abbrev})
         return players
     except:
         return []
 
-def get_player_advanced_stats(player_id: int) -> Dict:
+def get_team_defense_stats(team_abbrev: str, status_callback=None) -> Dict:
+    """Get defense stats with 20-game window."""
     try:
-        url = f"{NHL_WEB_API}/player/{player_id}/landing"
+        url = f"{NHL_WEB_API}/club-schedule-season/{team_abbrev}/{SEASON}"
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
-        data = resp.json()
         
-        season_stats = {}
-        for season in data.get("seasonTotals", []):
-            if str(season.get("season")) == SEASON and season.get("gameTypeId") == GAME_TYPE:
-                season_stats = season
-                break
+        completed = [g for g in resp.json().get("games", []) 
+                    if g.get("gameType") == GAME_TYPE and g.get("gameState") == "OFF"]
         
-        pp_toi = season_stats.get("powerPlayToi", "00:00")
-        gp = season_stats.get("gamesPlayed", 1)
+        if not completed:
+            return {"team_abbrev": team_abbrev, "shots_allowed_per_game": 30.0, "grade": "C", "trend": "stable", "games": 0}
         
-        try:
-            parts = pp_toi.split(":")
-            total_mins = int(parts[0]) + int(parts[1]) / 60
-            pp_toi_per_game = total_mins / gp if gp > 0 else 0
-        except:
-            pp_toi_per_game = 0
+        recent = completed[-20:]
+        sa_list = []
         
-        return {"pp_toi_per_game": round(pp_toi_per_game, 2)}
-    except:
-        return {"pp_toi_per_game": 0}
-
-def get_team_defense_stats(teams_to_fetch: set, progress_callback=None) -> Dict[str, TeamDefense]:
-    all_teams = get_all_teams()
-    team_defense = {}
-    
-    for i, team in enumerate(all_teams):
-        abbrev = team["abbrev"]
-        if progress_callback:
-            progress_callback((i + 1) / len(all_teams), f"Fetching {abbrev}...")
-        
-        try:
-            url = f"{NHL_WEB_API}/club-schedule-season/{abbrev}/{SEASON}"
-            resp = requests.get(url, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            
-            completed = [g for g in data.get("games", []) 
-                        if g.get("gameType") == GAME_TYPE and g.get("gameState") == "OFF"]
-            
-            if not completed:
-                team_defense[abbrev] = TeamDefense(
-                    team_abbrev=abbrev, team_name=team["name"],
-                    games_played=0, shots_allowed_per_game=30.0,
-                    shots_allowed_L5=30.0, pk_shots_allowed=8.0,
-                    grade="C", recent_trend="➡️ STABLE"
-                )
+        for game in recent:
+            try:
+                box_url = f"{NHL_WEB_API}/gamecenter/{game['id']}/boxscore"
+                box_resp = requests.get(box_url, timeout=10)
+                box_data = box_resp.json()
+                
+                home_abbrev = box_data.get("homeTeam", {}).get("abbrev", "")
+                home_sog = box_data.get("homeTeam", {}).get("sog", 0)
+                away_sog = box_data.get("awayTeam", {}).get("sog", 0)
+                
+                if home_sog == 0 and away_sog == 0:
+                    for stat in box_data.get("boxscore", {}).get("teamGameStats", []):
+                        if stat.get("category") == "sog":
+                            home_sog = stat.get("homeValue", 0)
+                            away_sog = stat.get("awayValue", 0)
+                            break
+                
+                if home_sog > 0 or away_sog > 0:
+                    sa = away_sog if team_abbrev == home_abbrev else home_sog
+                    if sa > 0: sa_list.append(sa)
+                
+                time.sleep(0.03)
+            except:
                 continue
-            
-            recent = completed[-20:]
-            recent_5 = completed[-5:] if len(completed) >= 5 else completed
-            
-            sa_all = []
-            sa_L5 = []
-            
-            for game in recent:
-                try:
-                    box_url = f"{NHL_WEB_API}/gamecenter/{game['id']}/boxscore"
-                    box_resp = requests.get(box_url, timeout=10)
-                    box_resp.raise_for_status()
-                    box_data = box_resp.json()
-                    
-                    home_abbrev = box_data.get("homeTeam", {}).get("abbrev", "")
-                    home_sog = box_data.get("homeTeam", {}).get("sog", 0)
-                    away_sog = box_data.get("awayTeam", {}).get("sog", 0)
-                    
-                    if home_sog == 0 and away_sog == 0:
-                        for stat in box_data.get("boxscore", {}).get("teamGameStats", []):
-                            if stat.get("category") == "sog":
-                                home_sog = stat.get("homeValue", 0)
-                                away_sog = stat.get("awayValue", 0)
-                                break
-                    
-                    if home_sog > 0 or away_sog > 0:
-                        sa = away_sog if abbrev == home_abbrev else home_sog
-                        if sa > 0:
-                            sa_all.append(sa)
-                            if game in recent_5:
-                                sa_L5.append(sa)
-                    
-                    time.sleep(0.03)
-                except:
-                    continue
-            
-            if sa_all:
-                sa_pg = statistics.mean(sa_all)
-                sa_L5_avg = statistics.mean(sa_L5) if sa_L5 else sa_pg
-            else:
-                sa_pg = 30.0
-                sa_L5_avg = 30.0
-            
-            if sa_L5_avg < sa_pg - 2:
-                trend = "🔒 TIGHTENING"
-            elif sa_L5_avg > sa_pg + 2:
-                trend = "📈 LOOSENING"
-            else:
-                trend = "➡️ STABLE"
-            
-            team_defense[abbrev] = TeamDefense(
-                team_abbrev=abbrev,
-                team_name=team["name"],
-                games_played=len(sa_all),
-                shots_allowed_per_game=round(sa_pg, 2),
-                shots_allowed_L5=round(sa_L5_avg, 2),
-                pk_shots_allowed=round(sa_pg * 0.25, 2),
-                grade=get_grade(sa_pg),
-                recent_trend=trend
-            )
-            
-        except:
-            team_defense[abbrev] = TeamDefense(
-                team_abbrev=abbrev, team_name=team["name"],
-                games_played=0, shots_allowed_per_game=30.0,
-                shots_allowed_L5=30.0, pk_shots_allowed=8.0,
-                grade="C", recent_trend="➡️ STABLE"
-            )
         
-        time.sleep(REQUEST_DELAY)
-    
-    sorted_teams = sorted(team_defense.values(), key=lambda x: x.shots_allowed_per_game, reverse=True)
-    for rank, team in enumerate(sorted_teams, 1):
-        team_defense[team.team_abbrev].rank = rank
-    
-    return team_defense
+        if not sa_list:
+            return {"team_abbrev": team_abbrev, "shots_allowed_per_game": 30.0, "grade": "C", "trend": "stable", "games": 0}
+        
+        sa_pg = statistics.mean(sa_list)
+        
+        # Trend detection
+        trend = "stable"
+        if len(sa_list) >= 10:
+            mid = len(sa_list) // 2
+            older = statistics.mean(sa_list[:mid])
+            recent_half = statistics.mean(sa_list[mid:])
+            diff = recent_half - older
+            if diff >= 2.5: trend = "loosening"
+            elif diff <= -2.5: trend = "tightening"
+        
+        return {
+            "team_abbrev": team_abbrev,
+            "shots_allowed_per_game": round(sa_pg, 2),
+            "grade": get_grade(sa_pg),
+            "trend": trend,
+            "games": len(sa_list)
+        }
+    except:
+        return {"team_abbrev": team_abbrev, "shots_allowed_per_game": 30.0, "grade": "C", "trend": "stable", "games": 0}
 
-def get_player_stats(player_id: int, name: str, team: str, position: str) -> Optional[PlayerStats]:
+def fetch_player_stats(player_info: Dict) -> Optional[Dict]:
     """
-    V5.1: Enhanced player stats with TOI and rate-based metrics.
+    V6: Enhanced player stats with TOI and rate-based metrics.
+    Single API call for speed.
     """
-    url = f"{NHL_WEB_API}/player/{player_id}/game-log/{SEASON}/{GAME_TYPE}"
+    player_id = player_info["id"]
+    name = player_info["name"]
+    team = player_info["team"]
+    position = player_info["position"]
     
+    url = f"{NHL_WEB_API}/player/{player_id}/game-log/{SEASON}/{GAME_TYPE}"
     try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
+        resp = requests.get(url, timeout=10)
         games = resp.json().get("gameLog", [])
         
         if len(games) < MIN_GAMES:
             return None
         
         # Initialize lists
-        all_shots = []
-        all_toi = []
-        all_shifts = []
-        home_shots = []
-        away_shots = []
-        opponents = []
+        all_shots, all_toi, all_shifts = [], [], []
+        home_shots, away_shots, game_dates = [], [], []
+        pp_goals = 0
         
         for game in games:
-            # Shots
-            shots = game.get("shots", 0)
-            if shots < 0:
-                shots = 0
+            shots = max(0, game.get("shots", 0))
             all_shots.append(shots)
             
-            # V5.1: TOI - parse from game log
+            # TOI
             toi_str = game.get("toi", "0:00")
-            toi_minutes = parse_toi(toi_str)
-            all_toi.append(toi_minutes)
+            toi_mins = parse_toi(toi_str)
+            all_toi.append(toi_mins)
             
-            # V5.1: Shifts
+            # Shifts
             shifts = game.get("shifts", 0)
             if shifts and shifts > 0:
                 all_shifts.append(shifts)
             
-            # Opponent
-            opponents.append(game.get("opponentAbbrev", ""))
+            game_dates.append(game.get("gameDate", ""))
+            pp_goals += game.get("powerPlayGoals", 0)
             
-            # Home/away
-            is_home = game.get("homeRoadFlag", "") == "H"
-            if is_home:
+            if game.get("homeRoadFlag", "") == "H":
                 home_shots.append(shots)
             else:
                 away_shots.append(shots)
@@ -622,6 +358,7 @@ def get_player_stats(player_id: int, name: str, team: str, position: str) -> Opt
         hit_2 = sum(1 for s in all_shots if s >= 2) / gp * 100
         hit_3 = sum(1 for s in all_shots if s >= 3) / gp * 100
         hit_4 = sum(1 for s in all_shots if s >= 4) / gp * 100
+        hit_5 = sum(1 for s in all_shots if s >= 5) / gp * 100
         
         # Recent averages
         l5 = all_shots[:5] if len(all_shots) >= 5 else all_shots
@@ -629,24 +366,31 @@ def get_player_stats(player_id: int, name: str, team: str, position: str) -> Opt
         l5_avg = sum(l5) / len(l5)
         l10_avg = sum(l10) / len(l10)
         
-        # Variance
         std = statistics.stdev(all_shots) if len(all_shots) > 1 else 0
         
         # Streak
         streak = 0
         for s in all_shots:
-            if s >= 2:
-                streak += 1
-            else:
-                break
+            if s >= 2: streak += 1
+            else: break
         
-        # Home/away
         home_avg = sum(home_shots) / len(home_shots) if home_shots else avg
         away_avg = sum(away_shots) / len(away_shots) if away_shots else avg
         
-        # =========================================
-        # V5.1: TOI calculations
-        # =========================================
+        # Bust rate (0-1 SOG games)
+        bust_rate = sum(1 for s in all_shots if s <= 1) / gp * 100
+        
+        # Shutout rate (0 SOG games) - V6
+        shutout_rate = sum(1 for s in all_shots if s == 0) / gp * 100
+        l5_shutouts = sum(1 for s in l5 if s == 0)
+        l10_shutouts = sum(1 for s in l10 if s == 0)
+        
+        # Cushion rates - V6
+        cushion_2 = sum(1 for s in all_shots if s >= 3) / gp * 100
+        cushion_3 = sum(1 for s in all_shots if s >= 4) / gp * 100
+        cushion_4 = sum(1 for s in all_shots if s >= 5) / gp * 100
+        
+        # TOI metrics - V6
         avg_toi = sum(all_toi) / len(all_toi) if all_toi else 0
         l5_toi_list = all_toi[:5] if len(all_toi) >= 5 else all_toi
         l10_toi_list = all_toi[:10] if len(all_toi) >= 10 else all_toi
@@ -654,392 +398,944 @@ def get_player_stats(player_id: int, name: str, team: str, position: str) -> Opt
         l10_toi = sum(l10_toi_list) / len(l10_toi_list) if l10_toi_list else 0
         toi_trend = get_toi_trend(l5_toi, avg_toi)
         
-        # =========================================
-        # V5.1: Rate-based metrics (THE KEY)
-        # =========================================
+        # SOG per 60 - V6
         total_shots = sum(all_shots)
         total_toi = sum(all_toi)
-        
-        # SOG per 60 minutes
         sog_per_60 = (total_shots / total_toi * 60) if total_toi > 0 else 0
         
-        # L5 SOG per 60
         l5_shots_sum = sum(l5)
         l5_toi_sum = sum(l5_toi_list)
         l5_sog_per_60 = (l5_shots_sum / l5_toi_sum * 60) if l5_toi_sum > 0 else 0
         
-        # L10 SOG per 60
-        l10_shots_sum = sum(l10)
-        l10_toi_sum = sum(l10_toi_list)
-        l10_sog_per_60 = (l10_shots_sum / l10_toi_sum * 60) if l10_toi_sum > 0 else 0
-        
-        # =========================================
-        # V5.1: Shift metrics
-        # =========================================
+        # Shifts metrics - V6
         avg_shifts = sum(all_shifts) / len(all_shifts) if all_shifts else 0
-        l5_shifts_list = all_shifts[:5] if len(all_shifts) >= 5 else all_shifts
-        l5_shifts = sum(l5_shifts_list) / len(l5_shifts_list) if l5_shifts_list else 0
-        
         total_shifts = sum(all_shifts) if all_shifts else 0
         sog_per_shift = total_shots / total_shifts if total_shifts > 0 else 0
         
-        # Average shift length in seconds
-        avg_shift_length = (total_toi * 60 / total_shifts) if total_shifts > 0 else 0
+        # PP detection
+        is_pp1 = (pp_goals >= 3 and avg >= 2.5) or (pp_goals >= 5)
         
-        # =========================================
-        # V5.1: Risk metrics
-        # =========================================
-        # Shutout rate
-        shutout_rate = sum(1 for s in all_shots if s == 0) / gp * 100
-        
-        # Recent shutouts
-        l5_shutouts = sum(1 for s in l5 if s == 0)
-        l10_shutouts = sum(1 for s in l10 if s == 0)
-        
-        # Cushion rates
-        cushion_rate_2 = sum(1 for s in all_shots if s >= 3) / gp * 100
-        cushion_rate_3 = sum(1 for s in all_shots if s >= 4) / gp * 100
-        cushion_rate_4 = sum(1 for s in all_shots if s >= 5) / gp * 100
+        # B2B detection
+        is_b2b = False
+        if game_dates and game_dates[0]:
+            try:
+                last_game = datetime.strptime(game_dates[0], "%Y-%m-%d")
+                if (datetime.now() - last_game).days == 1:
+                    is_b2b = True
+            except:
+                pass
         
         # Percentiles
-        percentile_10 = calculate_percentile(all_shots, 10)
-        percentile_25 = calculate_percentile(all_shots, 25)
+        p10 = calculate_percentile(all_shots, 10)
+        p25 = calculate_percentile(all_shots, 25)
         
-        # PP stats
-        adv_stats = get_player_advanced_stats(player_id)
-        pp_toi = adv_stats.get("pp_toi_per_game", 0)
-        is_pp1 = pp_toi >= 2.0
-        
-        return PlayerStats(
-            player_id=player_id, name=name, team=team, position=position,
-            games_played=gp,
-            hit_rate_2plus=round(hit_2, 1),
-            hit_rate_3plus=round(hit_3, 1),
-            hit_rate_4plus=round(hit_4, 1),
-            avg_sog=round(avg, 2),
-            last_5_avg=round(l5_avg, 2),
-            last_10_avg=round(l10_avg, 2),
-            std_dev=round(std, 2),
-            floor=min(all_shots),
-            ceiling=max(all_shots),
-            current_streak=streak,
-            home_avg=round(home_avg, 2),
-            away_avg=round(away_avg, 2),
-            pp_toi=pp_toi,
-            is_pp1=is_pp1,
-            all_shots=all_shots,
-            opponents=opponents,
-            # V5.1 TOI
-            avg_toi=round(avg_toi, 1),
-            l5_toi=round(l5_toi, 1),
-            l10_toi=round(l10_toi, 1),
-            toi_trend=toi_trend,
-            all_toi=all_toi,
-            # V5.1 Rate metrics
-            sog_per_60=round(sog_per_60, 2),
-            l5_sog_per_60=round(l5_sog_per_60, 2),
-            l10_sog_per_60=round(l10_sog_per_60, 2),
-            # V5.1 Shift metrics
-            avg_shifts=round(avg_shifts, 1),
-            l5_shifts=round(l5_shifts, 1),
-            sog_per_shift=round(sog_per_shift, 3),
-            avg_shift_length=round(avg_shift_length, 1),
-            all_shifts=all_shifts,
-            # V5.1 Risk metrics
-            shutout_rate=round(shutout_rate, 1),
-            cushion_rate_2=round(cushion_rate_2, 1),
-            cushion_rate_3=round(cushion_rate_3, 1),
-            cushion_rate_4=round(cushion_rate_4, 1),
-            l10_shutouts=l10_shutouts,
-            l5_shutouts=l5_shutouts,
-            percentile_10=percentile_10,
-            percentile_25=percentile_25,
-        )
-    except Exception as e:
+        return {
+            "player_id": player_id, "name": name, "team": team, "position": position,
+            "games_played": gp,
+            "hit_rate_2plus": round(hit_2, 1),
+            "hit_rate_3plus": round(hit_3, 1),
+            "hit_rate_4plus": round(hit_4, 1),
+            "hit_rate_5plus": round(hit_5, 1),
+            "avg_sog": round(avg, 2),
+            "last_5_avg": round(l5_avg, 2),
+            "last_10_avg": round(l10_avg, 2),
+            "std_dev": round(std, 2),
+            "floor": min(all_shots),
+            "ceiling": max(all_shots),
+            "current_streak": streak,
+            "home_avg": round(home_avg, 2),
+            "away_avg": round(away_avg, 2),
+            "bust_rate": round(bust_rate, 1),
+            "is_pp1": is_pp1,
+            "is_b2b": is_b2b,
+            "pp_goals": pp_goals,
+            # V6 new metrics
+            "shutout_rate": round(shutout_rate, 1),
+            "l5_shutouts": l5_shutouts,
+            "l10_shutouts": l10_shutouts,
+            "cushion_2": round(cushion_2, 1),
+            "cushion_3": round(cushion_3, 1),
+            "cushion_4": round(cushion_4, 1),
+            "avg_toi": round(avg_toi, 1),
+            "l5_toi": round(l5_toi, 1),
+            "l10_toi": round(l10_toi, 1),
+            "toi_trend": toi_trend,
+            "sog_per_60": round(sog_per_60, 2),
+            "l5_sog_per_60": round(l5_sog_per_60, 2),
+            "avg_shifts": round(avg_shifts, 1),
+            "sog_per_shift": round(sog_per_shift, 3),
+            "p10": p10,
+            "p25": p25,
+        }
+    except:
         return None
 
 # ============================================================================
-# V5.1: ENHANCED CONFIDENCE CALCULATIONS
+# V6: ENHANCED PARLAY SCORE
 # ============================================================================
-def calculate_adjusted_lambda(player: PlayerStats, opp_def: TeamDefense, is_home: bool) -> float:
+def calculate_parlay_score(player: Dict, opp_def: Dict, is_home: bool, threshold: int, is_hot: bool, is_cold: bool) -> Tuple[int, List[str], List[str]]:
     """
-    V5.1: Rate-based projection using SOG/60 * expected TOI.
+    V6: Comprehensive parlay score (0-100) with edge/risk tracking.
+    Weighted optimally based on research for maximum predictability.
     """
-    # Rate-based projection if we have TOI data
-    if player.avg_toi > 0 and player.sog_per_60 > 0:
-        # Weighted rate (recent weighted more)
-        weighted_rate = (player.l5_sog_per_60 * 0.4) + (player.l10_sog_per_60 * 0.3) + (player.sog_per_60 * 0.3)
-        
-        # Project TOI
-        if player.toi_trend == "📈 UP":
-            expected_toi = player.l5_toi * 1.02
-        elif player.toi_trend == "📉 DOWN":
-            expected_toi = player.l5_toi * 0.98
-        else:
-            expected_toi = (player.l5_toi * 0.6) + (player.avg_toi * 0.4)
-        
-        # Base from rate
-        base = (weighted_rate / 60) * expected_toi
-    else:
-        # Fallback
-        base = (player.last_5_avg * 0.4) + (player.last_10_avg * 0.3) + (player.avg_sog * 0.3)
-    
-    # Home/away
-    if is_home and player.home_avg > 0:
-        home_factor = player.home_avg / player.avg_sog if player.avg_sog > 0 else 1.0
-    elif not is_home and player.away_avg > 0:
-        home_factor = player.away_avg / player.avg_sog if player.avg_sog > 0 else 1.0
-    else:
-        home_factor = 1.02 if is_home else 0.98
-    
-    # Opponent
-    opp_factor = opp_def.shots_allowed_per_game / 30.0 if opp_def.shots_allowed_per_game > 0 else 1.0
-    if opp_def.shots_allowed_L5 > 0:
-        recent_factor = opp_def.shots_allowed_L5 / 30.0
-        opp_factor = (opp_factor * 0.6) + (recent_factor * 0.4)
-    
-    # PP
-    pp_factor = 1.0
-    if player.is_pp1:
-        pp_factor = 1.15
-    elif player.pp_toi > 1.0:
-        pp_factor = 1.08
-    
-    return base * home_factor * opp_factor * pp_factor
-
-def calculate_confidence(player: PlayerStats, opp: TeamDefense, is_home: bool,
-                         threshold: int = 2) -> Tuple[float, List[str], List[str]]:
-    """V5.1: Enhanced confidence with rate and risk metrics."""
+    score = 50  # Base
     edges = []
     risks = []
-    score = 50
     
-    hit_rate = player.hit_rate_2plus if threshold == 2 else player.hit_rate_3plus if threshold == 3 else player.hit_rate_4plus
-    cushion = player.cushion_rate_2 if threshold == 2 else player.cushion_rate_3 if threshold == 3 else player.cushion_rate_4
+    hit_rate = player.get(f"hit_rate_{threshold}plus", 0)
+    cushion_key = f"cushion_{threshold}"
+    cushion = player.get(cushion_key, 0)
     
-    # HIT RATE
-    if hit_rate >= 90:
+    # ========== HIT RATE (max +25) - Most important ==========
+    if hit_rate >= 95:
         score += 25
-        edges.append(f"Elite {hit_rate}% hit rate")
-    elif hit_rate >= 85:
+        edges.append(f"Elite {hit_rate:.0f}% hit")
+    elif hit_rate >= 90:
         score += 20
-        edges.append(f"Strong {hit_rate}% hit rate")
-    elif hit_rate >= 80:
+        edges.append(f"Strong {hit_rate:.0f}% hit")
+    elif hit_rate >= 85:
         score += 15
+    elif hit_rate >= 80:
+        score += 10
     elif hit_rate >= 75:
-        score += 10
-    elif hit_rate < 70:
-        score -= 15
-        risks.append(f"Low {hit_rate}% hit rate")
-    
-    # CUSHION RATE
-    if cushion >= 75:
-        score += 10
-        edges.append(f"🛡️ {cushion:.0f}% cushion rate")
-    elif cushion >= 60:
         score += 5
-    elif cushion < 40:
+    elif hit_rate < 70:
+        score -= 10
+        risks.append(f"Low {hit_rate:.0f}% hit")
+    
+    # ========== SHUTOUT RATE (max +10/-15) - Key V6 metric ==========
+    shutout = player.get("shutout_rate", 10)
+    if shutout <= 3:
+        score += 10
+        edges.append(f"Rare shutouts ({shutout:.0f}%)")
+    elif shutout <= 5:
+        score += 6
+    elif shutout <= 8:
+        score += 3
+    elif shutout > 15:
+        score -= 15
+        risks.append(f"🚨 High shutout ({shutout:.0f}%)")
+    elif shutout > 10:
+        score -= 8
+        risks.append(f"⚠️ Shutout risk ({shutout:.0f}%)")
+    
+    # ========== RECENT SHUTOUTS (max -20) ==========
+    l5_so = player.get("l5_shutouts", 0)
+    if l5_so >= 2:
+        score -= 20
+        risks.append(f"🚨 {l5_so} shutouts in L5!")
+    elif l5_so == 1:
+        score -= 10
+        risks.append("⚠️ Shutout in L5")
+    
+    # ========== CUSHION RATE (max +8) ==========
+    if cushion >= 75:
+        score += 8
+        edges.append(f"🛡️ {cushion:.0f}% cushion")
+    elif cushion >= 60:
+        score += 4
+    elif cushion < 35:
         score -= 5
         risks.append(f"Low cushion ({cushion:.0f}%)")
     
-    # SHUTOUT RATE (key V5.1 metric)
-    if player.shutout_rate <= 3:
-        score += 10
-        edges.append(f"Rarely shutout ({player.shutout_rate:.0f}%)")
-    elif player.shutout_rate <= 6:
-        score += 5
-    elif player.shutout_rate > 12:
-        score -= 15
-        risks.append(f"🚨 High shutout rate ({player.shutout_rate:.0f}%)")
-    elif player.shutout_rate > 8:
-        score -= 8
-        risks.append(f"⚠️ Elevated shutout ({player.shutout_rate:.0f}%)")
-    
-    # RECENT SHUTOUTS
-    if player.l5_shutouts >= 2:
-        score -= 20
-        risks.append(f"🚨 {player.l5_shutouts} shutouts in L5!")
-    elif player.l5_shutouts == 1:
-        score -= 10
-        risks.append(f"⚠️ Shutout in L5")
-    elif player.l10_shutouts >= 2:
-        score -= 8
-        risks.append(f"⚠️ {player.l10_shutouts} shutouts in L10")
-    
-    # FORM
-    form_diff = player.last_5_avg - player.avg_sog
-    if form_diff >= 1.0:
-        score += 15
-        edges.append(f"🔥 Hot (L5: {player.last_5_avg})")
-    elif form_diff >= 0.5:
-        score += 10
-    elif form_diff <= -1.0:
-        score -= 15
-        risks.append(f"❄️ Cold (L5: {player.last_5_avg})")
-    elif form_diff <= -0.5:
-        score -= 10
-    
-    # TOI TREND
-    if player.avg_toi > 0:
-        if player.toi_trend == "📈 UP":
-            score += 8
-            edges.append(f"📈 TOI up (L5: {player.l5_toi:.0f}m)")
-        elif player.toi_trend == "📉 DOWN":
-            score -= 10
-            risks.append(f"📉 TOI down (L5: {player.l5_toi:.0f}m)")
-    
-    # SOG/60 RATE
-    if player.sog_per_60 >= 10.0:
-        score += 10
-        edges.append(f"⚡ Elite rate ({player.sog_per_60:.1f}/60)")
-    elif player.sog_per_60 >= 8.0:
-        score += 5
-        edges.append(f"High rate ({player.sog_per_60:.1f}/60)")
-    elif player.sog_per_60 < 5.0 and player.sog_per_60 > 0:
-        score -= 5
-        risks.append(f"Low rate ({player.sog_per_60:.1f}/60)")
-    
-    # Rate trend
-    if player.sog_per_60 > 0 and player.l5_sog_per_60 > player.sog_per_60 * 1.15:
-        score += 5
-        edges.append(f"Rate trending up")
-    elif player.sog_per_60 > 0 and player.l5_sog_per_60 < player.sog_per_60 * 0.85:
-        score -= 5
-        risks.append(f"Rate trending down")
-    
-    # MATCHUP
-    if opp.grade in ["A+", "A"]:
-        score += 15
-        edges.append(f"Soft matchup ({opp.team_abbrev}: {opp.shots_allowed_per_game} SA/G)")
-    elif opp.grade == "B+":
-        score += 8
-    elif opp.grade in ["D", "F"]:
-        score -= 15
-        risks.append(f"Tough matchup ({opp.team_abbrev})")
-    
-    if "LOOSENING" in opp.recent_trend:
-        score += 8
-        edges.append(f"Defense loosening")
-    elif "TIGHTENING" in opp.recent_trend:
-        score -= 8
-        risks.append("Defense tightening")
-    
-    # PP
-    if player.is_pp1:
-        score += 10
-        edges.append(f"⚡ PP1 ({player.pp_toi:.1f} min/g)")
-    elif player.pp_toi > 1.0:
-        score += 5
-    
-    # VARIANCE
-    if player.std_dev < 0.8:
+    # ========== FLOOR (max +12) ==========
+    floor = player.get("floor", 0)
+    if floor >= threshold:
         score += 12
-        edges.append(f"Very consistent (σ={player.std_dev})")
-    elif player.std_dev < 1.2:
+        edges.append(f"🔒 Floor={floor} NEVER misses!")
+    elif floor >= 2:
         score += 8
-    elif player.std_dev > 2.5:
-        score -= 18
-        risks.append(f"🎲 Extreme variance (σ={player.std_dev})")
-    elif player.std_dev > 2.0:
-        score -= 12
-        risks.append(f"High variance (σ={player.std_dev})")
-    elif player.std_dev > 1.8:
-        score -= 6
-    
-    # FLOOR
-    if player.floor >= threshold:
-        score += 15
-        edges.append(f"🔒 Floor={player.floor} NEVER misses!")
-    elif player.floor >= 1:
-        score += 8
-        edges.append(f"🛡️ Never shutout")
-    
-    # P10 floor
-    if player.percentile_10 >= threshold:
-        score += 8
-        edges.append(f"P10 clears ({player.percentile_10})")
-    elif player.percentile_10 == 0:
-        score -= 5
-        risks.append(f"P10 shows shutout risk")
-    
-    # HOME/AWAY
-    if is_home and player.home_avg > player.away_avg + 0.3:
+        edges.append("🛡️ Never below 2")
+    elif floor >= 1:
         score += 5
-        edges.append(f"Home boost")
-    elif not is_home and player.away_avg < player.home_avg - 0.3:
+        edges.append("🛡️ Never shutout")
+    elif floor == 0:
         score -= 5
-        risks.append("Road penalty")
+        risks.append("Floor=0 risk")
+    
+    # ========== SOG/60 RATE (max +8) ==========
+    sog60 = player.get("sog_per_60", 0)
+    if sog60 >= 10.0:
+        score += 8
+        edges.append(f"⚡ Elite rate ({sog60:.1f}/60)")
+    elif sog60 >= 8.0:
+        score += 4
+    elif sog60 < 5.0 and sog60 > 0:
+        score -= 4
+        risks.append(f"Low rate ({sog60:.1f}/60)")
+    
+    # ========== TOI TREND (max +6/-8) ==========
+    toi_trend = player.get("toi_trend", "➡️")
+    if toi_trend == "📈":
+        score += 6
+        edges.append(f"📈 TOI increasing")
+    elif toi_trend == "📉":
+        score -= 8
+        risks.append(f"📉 TOI decreasing")
+    
+    # ========== VOLUME (max +8) ==========
+    avg = player.get("avg_sog", 0)
+    if avg >= 4.0:
+        score += 8
+        edges.append(f"High volume ({avg:.1f})")
+    elif avg >= 3.5:
+        score += 6
+    elif avg >= 3.0:
+        score += 4
+    elif avg >= 2.5:
+        score += 2
+    
+    # ========== PP1 (max +8) ==========
+    if player.get("is_pp1"):
+        score += 8
+        edges.append("⚡ PP1")
+    
+    # ========== VARIANCE (max +8/-12) ==========
+    std = player.get("std_dev", 1.5)
+    if std < 0.8:
+        score += 8
+        edges.append(f"Very consistent (σ={std:.1f})")
+    elif std < 1.2:
+        score += 4
+    elif std > 2.5:
+        score -= 12
+        risks.append(f"🎲 High variance (σ={std:.1f})")
+    elif std > 2.0:
+        score -= 8
+        risks.append(f"⚠️ Volatile (σ={std:.1f})")
+    elif std > 1.6:
+        score -= 4
+    
+    # ========== MATCHUP (max +10/-8) ==========
+    opp_grade = opp_def.get("grade", "C")
+    if opp_grade == "A+":
+        score += 10
+        edges.append(f"Soft matchup ({opp_grade})")
+    elif opp_grade == "A":
+        score += 7
+        edges.append(f"Good matchup ({opp_grade})")
+    elif opp_grade == "B":
+        score += 4
+    elif opp_grade == "D":
+        score -= 5
+        risks.append(f"Tough matchup ({opp_grade})")
+    elif opp_grade == "F":
+        score -= 8
+        risks.append(f"Hard matchup ({opp_grade})")
+    
+    # Defense trend
+    opp_trend = opp_def.get("trend", "stable")
+    if opp_trend == "loosening":
+        score += 4
+        edges.append("Def loosening 📈")
+    elif opp_trend == "tightening":
+        score -= 4
+        risks.append("Def tightening 📉")
+    
+    # ========== FORM (max +5/-8) ==========
+    if is_hot:
+        score += 5
+        edges.append("🔥 Hot")
+    elif is_cold:
+        score -= 8
+        risks.append("❄️ Cold")
+    
+    # ========== SITUATIONAL (max +2/-3) ==========
+    if is_home:
+        score += 2
+    
+    if player.get("is_b2b"):
+        score -= 3
+        risks.append("B2B")
     
     return max(0, min(100, score)), edges, risks
 
 # ============================================================================
-# PARLAY BUILDER
+# V6: PROBABILITY MODEL WITH CAPS
 # ============================================================================
-def build_parlay_legs(plays: List[BettingPlay], threshold: int) -> List[ParlayLeg]:
-    legs = []
-    for play in plays:
-        prob = play.prob_2plus / 100 if threshold == 2 else play.prob_3plus / 100 if threshold == 3 else play.prob_4plus / 100
-        
-        legs.append(ParlayLeg(
-            player_name=play.player.name,
-            team=play.player.team,
-            opponent=play.opponent,
-            threshold=threshold - 0.5,
-            our_prob=prob,
-            confidence=int(play.confidence),
-            tier=play.tier,
-            game_id=play.game_id,
-            is_pp1=play.player.is_pp1
-        ))
+def calculate_model_probability(player: Dict, opp_def: Dict, is_home: bool, threshold: int) -> Tuple[float, bool, str]:
+    """V6: Poisson probability with caps to prevent overconfidence."""
     
-    return legs
+    # Rate-based lambda if TOI available
+    if player.get("avg_toi", 0) > 0 and player.get("sog_per_60", 0) > 0:
+        # Weight recent rates more
+        l5_rate = player.get("l5_sog_per_60", 0)
+        season_rate = player.get("sog_per_60", 0)
+        weighted_rate = l5_rate * 0.5 + season_rate * 0.5
+        
+        # Project TOI
+        toi_trend = player.get("toi_trend", "➡️")
+        if toi_trend == "📈":
+            expected_toi = player.get("l5_toi", 0) * 1.02
+        elif toi_trend == "📉":
+            expected_toi = player.get("l5_toi", 0) * 0.98
+        else:
+            expected_toi = (player.get("l5_toi", 0) * 0.6) + (player.get("avg_toi", 0) * 0.4)
+        
+        base_lambda = (weighted_rate / 60) * expected_toi
+    else:
+        # Fallback to traditional weighting
+        base_lambda = (
+            player["last_5_avg"] * 0.45 +
+            player["last_10_avg"] * 0.30 +
+            player["avg_sog"] * 0.25
+        )
+    
+    # Adjustments
+    hit_rate = player.get(f"hit_rate_{threshold}plus", 75)
+    if hit_rate >= 95: hr_factor = 1.15
+    elif hit_rate >= 90: hr_factor = 1.12
+    elif hit_rate >= 85: hr_factor = 1.08
+    elif hit_rate >= 80: hr_factor = 1.04
+    else: hr_factor = 1.0
+    
+    pp_factor = 1.15 if player.get("is_pp1") else 1.0
+    ha_factor = 1.03 if is_home else 0.97
+    opp_factor = opp_def.get("shots_allowed_per_game", 30.0) / 30.0
+    
+    adj_lambda = base_lambda * hr_factor * pp_factor * ha_factor * opp_factor
+    
+    # Raw probability
+    raw_prob = poisson_prob_at_least(adj_lambda, threshold) * 100
+    
+    # Apply caps
+    max_prob = PROB_CAPS["max_absolute"]
+    cap_reasons = []
+    
+    if player.get("shutout_rate", 0) > 8:
+        max_prob = min(max_prob, PROB_CAPS["high_shutout"])
+        cap_reasons.append(f"shut={player.get('shutout_rate', 0):.0f}%")
+    
+    if player.get("std_dev", 0) > 2.0:
+        max_prob = min(max_prob, PROB_CAPS["high_variance"])
+        cap_reasons.append(f"σ={player.get('std_dev', 0):.1f}")
+    
+    if player.get("l5_shutouts", 0) >= 1:
+        max_prob = min(max_prob, PROB_CAPS["recent_shutout"])
+        cap_reasons.append("L5_shut")
+    
+    if player.get("toi_trend") == "📉":
+        max_prob = min(max_prob, PROB_CAPS["toi_dropping"])
+        cap_reasons.append("TOI↓")
+    
+    if player.get("games_played", 0) < 20:
+        max_prob = min(max_prob, PROB_CAPS["small_sample"])
+        cap_reasons.append(f"n={player.get('games_played', 0)}")
+    
+    if raw_prob > max_prob:
+        return max_prob, True, ", ".join(cap_reasons)
+    
+    return raw_prob, False, ""
 
-def generate_parlays(legs: List[ParlayLeg], num_legs: int, max_parlays: int = 5) -> List[Parlay]:
-    if len(legs) < num_legs:
+# ============================================================================
+# PARLAY GENERATION
+# ============================================================================
+def generate_best_parlay(plays: List[Dict], num_legs: int, threshold: int) -> Optional[Dict]:
+    if len(plays) < num_legs:
+        return None
+    
+    sorted_plays = sorted(plays, key=lambda x: x.get("parlay_score", 0), reverse=True)
+    best_legs = sorted_plays[:num_legs]
+    
+    prob_key = f"prob_{threshold}plus"
+    probs = [p[prob_key] / 100 for p in best_legs]
+    combined_prob, american_odds = calculate_parlay_odds(probs)
+    avg_score = sum(p.get("parlay_score", 0) for p in best_legs) / num_legs
+    min_score = min(p.get("parlay_score", 0) for p in best_legs)
+    
+    return {
+        "legs": best_legs,
+        "num_legs": num_legs,
+        "combined_prob": combined_prob,
+        "american_odds": american_odds,
+        "payout_per_100": calculate_parlay_payout(american_odds, 100),
+        "avg_parlay_score": avg_score,
+        "min_parlay_score": min_score,
+    }
+
+# ============================================================================
+# RESULTS FETCHING
+# ============================================================================
+def fetch_results(check_date: str, threshold: int, status_container):
+    """Fetch results for saved picks."""
+    if check_date not in st.session_state.saved_picks:
+        status_container.warning(f"No picks saved for {check_date}")
+        return
+    
+    picks = st.session_state.saved_picks[check_date]
+    pick_by_id = {str(p["player_id"]): p for p in picks}
+    pick_by_name = {p["player"].lower().strip(): p for p in picks}
+    
+    games = get_todays_schedule(check_date)
+    if not games:
+        status_container.error(f"No games found for {check_date}")
+        return
+    
+    results_found = 0
+    games_finished = 0
+    
+    progress = status_container.progress(0, text="Fetching game results...")
+    
+    for i, game in enumerate(games):
+        progress.progress((i + 1) / len(games), text=f"Checking {game['away_team']}@{game['home_team']}...")
+        
+        try:
+            box_url = f"{NHL_WEB_API}/gamecenter/{game['id']}/boxscore"
+            resp = requests.get(box_url, timeout=15)
+            if resp.status_code != 200:
+                continue
+            
+            box_data = resp.json()
+            game_state = box_data.get("gameState", "")
+            
+            if game_state not in ["OFF", "FINAL"]:
+                continue
+            
+            games_finished += 1
+            
+            # Try multiple paths for player stats
+            player_locations = []
+            
+            if "boxscore" in box_data and "playerByGameStats" in box_data.get("boxscore", {}):
+                pbgs = box_data["boxscore"]["playerByGameStats"]
+                for team_key in ["homeTeam", "awayTeam"]:
+                    if team_key in pbgs:
+                        for pos in ["forwards", "defense"]:
+                            if pos in pbgs[team_key]:
+                                player_locations.extend(pbgs[team_key][pos])
+            
+            if "playerByGameStats" in box_data:
+                pbgs = box_data["playerByGameStats"]
+                for team_key in ["homeTeam", "awayTeam"]:
+                    if team_key in pbgs:
+                        for pos in ["forwards", "defense"]:
+                            if pos in pbgs[team_key]:
+                                player_locations.extend(pbgs[team_key][pos])
+            
+            for player in player_locations:
+                pid = player.get("playerId") or player.get("id")
+                pid_str = str(pid) if pid else ""
+                
+                name_data = player.get("name", {})
+                if isinstance(name_data, dict):
+                    player_name = name_data.get("default", "")
+                else:
+                    player_name = str(name_data) if name_data else ""
+                
+                actual_sog = player.get("sog", 0) or player.get("shots", 0) or 0
+                
+                matched_pick = None
+                if pid_str and pid_str in pick_by_id:
+                    matched_pick = pick_by_id[pid_str]
+                elif player_name and player_name.lower().strip() in pick_by_name:
+                    matched_pick = pick_by_name[player_name.lower().strip()]
+                
+                if matched_pick:
+                    matched_pick["actual_sog"] = actual_sog
+                    matched_pick["hit"] = 1 if actual_sog >= threshold else 0
+                    results_found += 1
+            
+            time.sleep(0.05)
+        except:
+            continue
+    
+    progress.empty()
+    
+    # Update session state
+    st.session_state.saved_picks[check_date] = picks
+    
+    # Save to history
+    if results_found > 0:
+        st.session_state.results_history[check_date] = picks
+        save_history(st.session_state.results_history)
+    
+    if games_finished == 0:
+        status_container.warning("⏳ No finished games found")
+    elif results_found == 0:
+        status_container.warning(f"⚠️ {games_finished} games finished but no picks matched")
+    else:
+        status_container.success(f"✅ Updated {results_found} picks from {games_finished} games")
+
+# ============================================================================
+# MAIN ANALYSIS
+# ============================================================================
+def run_analysis(date_str: str, threshold: int, status_container) -> List[Dict]:
+    """Run full analysis with detailed progress."""
+    
+    games = get_todays_schedule(date_str)
+    if not games:
+        status_container.error("No games found!")
         return []
     
-    sorted_legs = sorted(legs, key=lambda x: (x.confidence, x.our_prob), reverse=True)
-    candidates = sorted_legs[:min(len(sorted_legs), 15)]
-    all_combos = list(combinations(candidates, num_legs))
+    # Show games
+    status_container.subheader(f"📅 Games: {date_str}")
+    game_df = pd.DataFrame([{"Away": g["away_team"], "Home": g["home_team"], "Time": g["time"]} for g in games])
+    status_container.dataframe(game_df, use_container_width=True, hide_index=True)
     
-    parlays = []
-    for combo in all_combos[:200]:
-        probs = [leg.our_prob for leg in combo]
-        combined_prob, combined_odds = calculate_parlay_odds(probs)
+    # Build team info
+    teams_playing = set()
+    game_info = {}
+    for game in games:
+        teams_playing.add(game["away_team"])
+        teams_playing.add(game["home_team"])
+        game_info[game["away_team"]] = {"opponent": game["home_team"], "home_away": "AWAY", "time": game["time"], "game_id": game["id"]}
+        game_info[game["home_team"]] = {"opponent": game["away_team"], "home_away": "HOME", "time": game["time"], "game_id": game["id"]}
+    
+    progress = status_container.progress(0, text="Starting analysis...")
+    
+    # Fetch defense stats
+    team_defense = {}
+    teams_list = list(teams_playing)
+    for i, team in enumerate(teams_list):
+        progress.progress(0.05 + (i / len(teams_list)) * 0.35, text=f"Fetching {team} defense...")
+        team_defense[team] = get_team_defense_stats(team)
+        time.sleep(0.05)
+    
+    # Fetch rosters
+    progress.progress(0.45, text="Fetching rosters...")
+    all_players = []
+    for team in teams_playing:
+        roster = get_team_roster(team)
+        all_players.extend(roster)
+    
+    # Analyze players
+    plays = []
+    total = len(all_players)
+    
+    for i, player_info in enumerate(all_players):
+        progress.progress(0.45 + (i / total) * 0.55, text=f"Analyzing {player_info['name']}...")
         
-        tier_scores = {"🔒 LOCK": 4, "✅ STRONG": 3, "📊 SOLID": 2, "⚠️ RISKY": 1, "❌ AVOID": 0}
-        avg_tier = sum(tier_scores.get(leg.tier, 0) for leg in combo) / num_legs
+        stats = fetch_player_stats(player_info)
+        if not stats:
+            continue
         
-        if avg_tier >= 3.5:
-            risk_level = "LOW"
-        elif avg_tier >= 2.5:
-            risk_level = "MEDIUM"
+        hit_rate = stats.get(f"hit_rate_{threshold}plus", 0)
+        if hit_rate < MIN_HIT_RATE:
+            continue
+        
+        info = game_info.get(player_info["team"])
+        if not info:
+            continue
+        
+        opp = info["opponent"]
+        opp_def = team_defense.get(opp, {"grade": "C", "trend": "stable", "shots_allowed_per_game": 30.0})
+        is_home = info["home_away"] == "HOME"
+        
+        # Trend
+        trend_emoji, is_hot, is_cold = get_trend(stats["last_5_avg"], stats["avg_sog"])
+        
+        # Parlay score
+        parlay_score, edges, risks = calculate_parlay_score(stats, opp_def, is_home, threshold, is_hot, is_cold)
+        
+        # Probability
+        prob, capped, cap_reason = calculate_model_probability(stats, opp_def, is_home, threshold)
+        
+        # Tags
+        tags = []
+        if stats.get("is_pp1"): tags.append("⚡")
+        if stats["floor"] >= 1: tags.append("🛡️")
+        if stats["current_streak"] >= 5: tags.append(f"🔥{stats['current_streak']}G")
+        if stats.get("is_b2b"): tags.append("B2B")
+        
+        play = {
+            "player": stats,
+            "opponent": opp,
+            "opponent_defense": opp_def,
+            "home_away": info["home_away"],
+            "game_time": info["time"],
+            "game_id": info["game_id"],
+            f"prob_{threshold}plus": round(prob, 1),
+            "prob_capped": capped,
+            "cap_reason": cap_reason,
+            "parlay_score": parlay_score,
+            "parlay_grade": get_grade_from_score(parlay_score),
+            "tier": get_tier_from_score(parlay_score),
+            "trend": trend_emoji,
+            "is_hot": is_hot,
+            "is_cold": is_cold,
+            "is_qualified": hit_rate >= 85 and not is_cold,
+            "tags": " ".join(tags),
+            "edges": edges,
+            "risks": risks,
+            "status_icon": "✅" if hit_rate >= 85 and not is_cold else "⚠️",
+        }
+        plays.append(play)
+    
+    progress.empty()
+    
+    if not plays:
+        status_container.warning("No qualifying plays found!")
+        return []
+    
+    # Sort by parlay score
+    plays.sort(key=lambda x: x["parlay_score"], reverse=True)
+    
+    # Save picks
+    picks_to_save = [{
+        "player_id": p["player"]["player_id"],
+        "player": p["player"]["name"],
+        "team": p["player"]["team"],
+        "opponent": p["opponent"],
+        "parlay_score": p["parlay_score"],
+        "parlay_grade": p["parlay_grade"],
+        "model_prob": p[f"prob_{threshold}plus"],
+        "hit_rate": p["player"][f"hit_rate_{threshold}plus"],
+        "is_qualified": p["is_qualified"],
+        "threshold": threshold,
+    } for p in plays]
+    
+    st.session_state.saved_picks[date_str] = picks_to_save
+    st.session_state.games = games
+    
+    return plays
+
+# ============================================================================
+# UI COMPONENTS
+# ============================================================================
+def show_all_results(plays: List[Dict], threshold: int, date_str: str):
+    """Tab 1: All results with full details."""
+    
+    hit_key = f"hit_rate_{threshold}plus"
+    prob_key = f"prob_{threshold}plus"
+    cushion_key = f"cushion_{threshold}"
+    
+    # Summary metrics
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    locks = len([p for p in plays if "LOCK" in p["tier"]])
+    strong = len([p for p in plays if "STRONG" in p["tier"]])
+    solid = len([p for p in plays if "SOLID" in p["tier"]])
+    capped = len([p for p in plays if p["prob_capped"]])
+    qualified = len([p for p in plays if p["is_qualified"]])
+    
+    col1.metric("🔒 Locks", locks)
+    col2.metric("✅ Strong", strong)
+    col3.metric("📊 Solid", solid)
+    col4.metric("🔻 Capped", capped)
+    col5.metric("✅ Qualified", qualified)
+    col6.metric("Total", len(plays))
+    
+    # Results table
+    data = []
+    for p in plays:
+        s = p["player"]
+        hit = s.get(hit_key, 0)
+        prob = p.get(prob_key, 0)
+        cushion = s.get(cushion_key, 0)
+        
+        opp_def = p["opponent_defense"]
+        def_grade = opp_def.get("grade", "C")
+        def_trend = opp_def.get("trend", "stable")
+        if def_trend == "loosening":
+            def_display = f"{def_grade}📈"
+        elif def_trend == "tightening":
+            def_display = f"{def_grade}📉"
         else:
-            risk_level = "HIGH"
+            def_display = def_grade
         
-        config = PARLAY_CONFIG.get(num_legs, PARLAY_CONFIG[3])
-        
-        parlay = Parlay(
-            legs=list(combo),
-            combined_prob=combined_prob,
-            combined_odds=combined_odds,
-            unit_size=config["unit_size"],
-            category=config["name"],
-            risk_level=risk_level
-        )
-        parlays.append(parlay)
+        data.append({
+            "": p["status_icon"],
+            "Tier": p["tier"],
+            "Player": s["name"],
+            "Score": f"{get_score_color(p['parlay_score'])} {p['parlay_score']}",
+            "Tags": p["tags"],
+            "Team": s["team"],
+            "vs": p["opponent"],
+            "Model%": f"{prob:.1f}%",
+            "Hit%": f"{hit:.0f}%",
+            "Cush%": f"{cushion:.0f}%",
+            "Shut%": f"{s.get('shutout_rate', 0):.0f}%",
+            "Avg": s["avg_sog"],
+            "L5": s["last_5_avg"],
+            "L10": s["last_10_avg"],
+            "SOG/60": s.get("sog_per_60", 0),
+            "TOI": f"{s.get('avg_toi', 0):.0f}m",
+            "TOI📈": s.get("toi_trend", ""),
+            "σ": s["std_dev"],
+            "Def": def_display,
+            "Cap": "🔻" if p["prob_capped"] else "",
+        })
     
-    parlays.sort(key=lambda x: x.combined_prob, reverse=True)
-    return parlays[:max_parlays]
+    st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+    
+    # Download
+    st.download_button("📥 Download CSV", data=pd.DataFrame(data).to_csv(index=False), 
+                      file_name=f"nhl_sog_v6_{date_str}.csv", mime="text/csv")
+
+def show_tiered_breakdown(plays: List[Dict], threshold: int):
+    """Tab 2: Breakdown by tier."""
+    
+    hit_key = f"hit_rate_{threshold}plus"
+    prob_key = f"prob_{threshold}plus"
+    cushion_key = f"cushion_{threshold}"
+    
+    locks = [p for p in plays if "LOCK" in p["tier"]]
+    strong = [p for p in plays if "STRONG" in p["tier"]]
+    solid = [p for p in plays if "SOLID" in p["tier"]]
+    risky = [p for p in plays if "RISKY" in p["tier"] or "AVOID" in p["tier"]]
+    
+    def show_tier_table(tier_plays, title, expanded=True):
+        with st.expander(f"{title} ({len(tier_plays)})", expanded=expanded):
+            if not tier_plays:
+                st.info("None")
+                return
+            
+            data = []
+            for p in tier_plays:
+                s = p["player"]
+                data.append({
+                    "Player": s["name"],
+                    "Score": f"{get_score_color(p['parlay_score'])} {p['parlay_score']}",
+                    "Tags": p["tags"],
+                    "vs": p["opponent"],
+                    "Model%": f"{p[prob_key]:.1f}%",
+                    "Hit%": f"{s[hit_key]:.0f}%",
+                    "Cush%": f"{s.get(cushion_key, 0):.0f}%",
+                    "Shut%": f"{s.get('shutout_rate', 0):.0f}%",
+                    "Avg": s["avg_sog"],
+                    "L5": s["last_5_avg"],
+                    "Floor": s["floor"],
+                })
+            
+            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
+            
+            # Show edges/risks for top picks
+            if len(tier_plays) <= 5:
+                for p in tier_plays:
+                    with st.container():
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if p["edges"]:
+                                st.success(f"**{p['player']['name']}**: {', '.join(p['edges'][:3])}")
+                        with col2:
+                            if p["risks"]:
+                                st.warning(f"**Risks**: {', '.join(p['risks'][:3])}")
+    
+    show_tier_table(locks, "🔒 LOCKS - Best for Parlays", True)
+    show_tier_table(strong, "✅ STRONG - Core Picks", True)
+    show_tier_table(solid, "📊 SOLID - Supporting Picks", False)
+    show_tier_table(risky, "⚠️ RISKY/AVOID - Use Caution", False)
+
+def show_parlays_tab(plays: List[Dict], threshold: int, unit_size: float):
+    """Tab 3: Parlay builder for all sizes."""
+    
+    prob_key = f"prob_{threshold}plus"
+    sorted_plays = sorted(plays, key=lambda x: x.get("parlay_score", 0), reverse=True)
+    
+    st.success(f"Building from **{len(sorted_plays)}** players (sorted by Parlay Score)")
+    
+    # Best parlay table for all sizes
+    st.subheader("📊 Best Parlay by Size")
+    
+    max_legs = min(len(sorted_plays), 15)
+    parlay_table = []
+    parlays_dict = {}
+    
+    for num_legs in range(1, max_legs + 1):
+        parlay = generate_best_parlay(sorted_plays, num_legs, threshold)
+        if parlay:
+            players = ", ".join([p["player"]["name"] for p in parlay["legs"]])
+            parlay_table.append({
+                "Legs": num_legs,
+                "Avg Score": f"{parlay['avg_parlay_score']:.0f}",
+                "Min Score": f"{parlay['min_parlay_score']:.0f}",
+                "Prob%": f"{parlay['combined_prob']*100:.1f}%",
+                "Odds": f"{parlay['american_odds']:+d}" if parlay['american_odds'] < 10000 else "—",
+                f"${unit_size:.0f}→": f"${parlay['payout_per_100'] * unit_size / 100:.0f}",
+                "Players": players[:70] + "..." if len(players) > 70 else players
+            })
+            parlays_dict[num_legs] = parlay
+    
+    # MAX parlay
+    if len(sorted_plays) > 0:
+        max_parlay = generate_best_parlay(sorted_plays, len(sorted_plays), threshold)
+        if max_parlay:
+            players = ", ".join([p["player"]["name"] for p in max_parlay["legs"]])
+            parlay_table.append({
+                "Legs": f"MAX ({len(sorted_plays)})",
+                "Avg Score": f"{max_parlay['avg_parlay_score']:.0f}",
+                "Min Score": f"{max_parlay['min_parlay_score']:.0f}",
+                "Prob%": f"{max_parlay['combined_prob']*100:.2f}%",
+                "Odds": f"{max_parlay['american_odds']:+d}" if max_parlay['american_odds'] < 100000 else "—",
+                f"${unit_size:.0f}→": f"${max_parlay['payout_per_100'] * unit_size / 100:.0f}",
+                "Players": players[:70] + "..." if len(players) > 70 else players
+            })
+            parlays_dict["MAX"] = max_parlay
+    
+    st.dataframe(pd.DataFrame(parlay_table), use_container_width=True, hide_index=True)
+    
+    # Copy buttons
+    st.subheader("📋 Copy Parlays")
+    
+    cols = st.columns(4)
+    copy_sizes = [2, 3, 5, 10]
+    
+    for i, size in enumerate(copy_sizes):
+        if size in parlays_dict:
+            parlay = parlays_dict[size]
+            with cols[i]:
+                with st.expander(f"**{size}-Leg** ({parlay['combined_prob']*100:.0f}%)"):
+                    text = f"🏒 NHL {size}-Leg Parlay\n" + "─" * 30 + "\n"
+                    for leg in parlay["legs"]:
+                        p = leg["player"]
+                        text += f"{get_score_color(leg['parlay_score'])} {p['name']} O{threshold-0.5} SOG\n"
+                    text += "─" * 30 + "\n"
+                    text += f"Combined: {parlay['combined_prob']*100:.1f}% | {parlay['american_odds']:+d}\n"
+                    st.code(text, language=None)
+    
+    # Recommended parlay
+    st.markdown("---")
+    st.subheader("🎯 Recommended Parlay")
+    
+    # Find optimal size (highest prob > 30%)
+    best_size = 2
+    for size in [3, 4, 5]:
+        if size in parlays_dict:
+            if parlays_dict[size]["combined_prob"] > 0.30:
+                best_size = size
+    
+    if best_size in parlays_dict:
+        rec = parlays_dict[best_size]
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Legs", best_size)
+        col2.metric("Probability", f"{rec['combined_prob']*100:.1f}%")
+        col3.metric("Odds", f"{rec['american_odds']:+d}")
+        col4.metric("Payout", f"${rec['payout_per_100'] * unit_size / 100:.0f}")
+        
+        rec_data = []
+        for leg in rec["legs"]:
+            p = leg["player"]
+            rec_data.append({
+                "Player": p["name"],
+                "Score": leg["parlay_score"],
+                "Tags": leg["tags"],
+                "Model%": f"{leg[prob_key]:.1f}%",
+                "Hit%": f"{p[f'hit_rate_{threshold}plus']:.0f}%",
+            })
+        st.dataframe(pd.DataFrame(rec_data), use_container_width=True, hide_index=True)
+
+def show_results_tracker(threshold: int):
+    """Results tracking tab."""
+    st.header("📈 Results Tracker")
+    
+    # Date selection
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        check_date = st.date_input("Check date:", value=get_est_datetime().date() - timedelta(days=1))
+        check_date_str = check_date.strftime("%Y-%m-%d")
+    
+    with col2:
+        if st.button("🔄 Fetch Results", type="primary"):
+            status = st.container()
+            fetch_results(check_date_str, threshold, status)
+    
+    # Show results if available
+    if check_date_str in st.session_state.saved_picks:
+        picks = st.session_state.saved_picks[check_date_str]
+        has_results = any(p.get("actual_sog") is not None for p in picks)
+        
+        if has_results:
+            hits = sum(1 for p in picks if p.get("hit") == 1)
+            total = len([p for p in picks if p.get("actual_sog") is not None])
+            
+            st.subheader(f"Results for {check_date_str}")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Hits", hits)
+            col2.metric("Total", total)
+            col3.metric("Win Rate", f"{hits/total*100:.1f}%" if total > 0 else "N/A")
+            
+            # Results by grade
+            grades = {}
+            for p in picks:
+                if p.get("actual_sog") is not None:
+                    grade = p.get("parlay_grade", "?")
+                    if grade not in grades:
+                        grades[grade] = {"hits": 0, "total": 0}
+                    grades[grade]["total"] += 1
+                    if p.get("hit") == 1:
+                        grades[grade]["hits"] += 1
+            
+            grade_data = []
+            for grade in ["A+", "A", "B+", "B", "C", "D"]:
+                if grade in grades:
+                    g = grades[grade]
+                    grade_data.append({
+                        "Grade": grade,
+                        "Hits": g["hits"],
+                        "Total": g["total"],
+                        "Win%": f"{g['hits']/g['total']*100:.0f}%" if g["total"] > 0 else "N/A"
+                    })
+            
+            if grade_data:
+                st.dataframe(pd.DataFrame(grade_data), use_container_width=True, hide_index=True)
+            
+            # Detailed results
+            results_data = []
+            for p in picks:
+                if p.get("actual_sog") is not None:
+                    results_data.append({
+                        "Player": p["player"],
+                        "Grade": p.get("parlay_grade", "?"),
+                        "Model%": f"{p.get('model_prob', 0):.1f}%",
+                        "Actual": p.get("actual_sog", "?"),
+                        "Hit": "✅" if p.get("hit") == 1 else "❌",
+                    })
+            
+            st.dataframe(pd.DataFrame(results_data), use_container_width=True, hide_index=True)
+    
+    # Historical summary
+    st.markdown("---")
+    st.subheader("📊 Historical Performance")
+    
+    history = st.session_state.results_history
+    if history:
+        total_hits = 0
+        total_picks = 0
+        by_grade = {}
+        
+        for date_str, picks in history.items():
+            for p in picks:
+                if p.get("actual_sog") is not None:
+                    total_picks += 1
+                    if p.get("hit") == 1:
+                        total_hits += 1
+                    
+                    grade = p.get("parlay_grade", "?")
+                    if grade not in by_grade:
+                        by_grade[grade] = {"hits": 0, "total": 0}
+                    by_grade[grade]["total"] += 1
+                    if p.get("hit") == 1:
+                        by_grade[grade]["hits"] += 1
+        
+        if total_picks > 0:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Picks", total_picks)
+            col2.metric("Total Hits", total_hits)
+            col3.metric("Overall Win%", f"{total_hits/total_picks*100:.1f}%")
+            
+            # By grade
+            hist_data = []
+            for grade in ["A+", "A", "B+", "B", "C", "D"]:
+                if grade in by_grade:
+                    g = by_grade[grade]
+                    hist_data.append({
+                        "Grade": grade,
+                        "Hits": g["hits"],
+                        "Total": g["total"],
+                        "Win%": f"{g['hits']/g['total']*100:.1f}%" if g["total"] > 0 else "N/A"
+                    })
+            
+            st.dataframe(pd.DataFrame(hist_data), use_container_width=True, hide_index=True)
+    else:
+        st.info("No historical results yet. Run analysis and fetch results to build history.")
 
 # ============================================================================
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Ultimate V5.1")
-    st.caption("Rate-based metrics: TOI, SOG/60, SOG/shift, and enhanced risk detection")
+    st.title("🏒 NHL SOG Analyzer V6")
+    st.caption("Comprehensive analysis with TOI, SOG/60, and historical tracking")
     
-    # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
         
@@ -1049,17 +1345,8 @@ def main():
         
         st.markdown("---")
         
-        bet_type = st.radio(
-            "SOG Threshold:",
-            ["Over 1.5 (2+ SOG)", "Over 2.5 (3+ SOG)", "Over 3.5 (4+ SOG)"],
-            index=0
-        )
+        bet_type = st.radio("SOG Threshold:", ["Over 1.5 (2+ SOG)", "Over 2.5 (3+ SOG)", "Over 3.5 (4+ SOG)"], index=0)
         threshold = 2 if "1.5" in bet_type else 3 if "2.5" in bet_type else 4
-        
-        st.markdown("---")
-        
-        min_hit_rate = st.slider("Min Hit Rate %", 50, 95, 75)
-        min_confidence = st.slider("Min Confidence", 0, 100, 40)
         
         st.markdown("---")
         
@@ -1067,33 +1354,29 @@ def main():
         
         st.markdown("---")
         
-        run_analysis = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
+        run_analysis_btn = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
         
         st.markdown("---")
-        st.caption(f"V5.1 | {get_est_datetime().strftime('%I:%M %p EST')}")
+        st.caption(f"V6.0 | {get_est_datetime().strftime('%I:%M %p EST')}")
     
     # Tabs
     tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 All Results", 
-        "🎯 Parlays", 
-        "🛡️ Defense", 
-        "📈 V5.1 Metrics"
+        "📊 All Results",
+        "🎯 Tiered Breakdown", 
+        "🎰 Parlays",
+        "📈 Results Tracker"
     ])
     
-    if 'plays' not in st.session_state:
-        st.session_state.plays = []
-    if 'threshold' not in st.session_state:
-        st.session_state.threshold = 2
-    
     with tab1:
-        if run_analysis:
-            plays = run_full_analysis(date_str, threshold, min_hit_rate, min_confidence)
+        if run_analysis_btn:
+            status_container = st.container()
+            plays = run_analysis(date_str, threshold, status_container)
             st.session_state.plays = plays
-            st.session_state.threshold = threshold
-        elif st.session_state.plays:
-            display_results(st.session_state.plays, st.session_state.threshold, date_str)
+        
+        if st.session_state.plays:
+            show_all_results(st.session_state.plays, threshold, date_str)
         else:
-            st.info("👈 Click **Run Analysis**")
+            st.info("👈 Click **Run Analysis** to start")
             games = get_todays_schedule(date_str)
             if games:
                 st.subheader(f"📅 Games: {date_str}")
@@ -1102,300 +1385,18 @@ def main():
     
     with tab2:
         if st.session_state.plays:
-            show_parlays(st.session_state.plays, st.session_state.threshold, unit_size)
+            show_tiered_breakdown(st.session_state.plays, threshold)
         else:
             st.info("Run analysis first")
     
     with tab3:
-        show_defense()
+        if st.session_state.plays:
+            show_parlays_tab(st.session_state.plays, threshold, unit_size)
+        else:
+            st.info("Run analysis first")
     
     with tab4:
-        show_metrics_guide()
-
-def run_full_analysis(date_str: str, threshold: int, min_hit_rate: float, 
-                     min_confidence: float) -> List[BettingPlay]:
-    
-    games = get_todays_schedule(date_str)
-    
-    if not games:
-        st.error("No games found!")
-        return []
-    
-    st.subheader(f"📅 Games: {date_str}")
-    game_df = pd.DataFrame([{"Away": g["away_team"], "Home": g["home_team"], "Time": g["time"]} for g in games])
-    st.dataframe(game_df, use_container_width=True, hide_index=True)
-    
-    teams_playing = set()
-    game_info = {}
-    
-    for game in games:
-        teams_playing.add(game["away_team"])
-        teams_playing.add(game["home_team"])
-        game_info[game["away_team"]] = {"opponent": game["home_team"], "home_away": "AWAY", "time": game["time"], "game_id": game["id"]}
-        game_info[game["home_team"]] = {"opponent": game["away_team"], "home_away": "HOME", "time": game["time"], "game_id": game["id"]}
-    
-    progress = st.progress(0)
-    progress.progress(0.1, "Fetching defense stats...")
-    
-    def update_progress(pct, msg):
-        progress.progress(0.1 + pct * 0.4, msg)
-    
-    team_defense = get_team_defense_stats(teams_playing, update_progress)
-    
-    progress.progress(0.55, "Fetching rosters...")
-    
-    all_players = []
-    for team in teams_playing:
-        roster = get_team_roster(team)
-        all_players.extend(roster)
-        time.sleep(REQUEST_DELAY)
-    
-    betting_plays = []
-    total = len(all_players)
-    
-    for i, player in enumerate(all_players):
-        progress.progress(0.55 + (i / total) * 0.45, f"Analyzing {player['name']}...")
-        
-        stats = get_player_stats(player["id"], player["name"], player["team"], player["position"])
-        
-        if not stats:
-            time.sleep(REQUEST_DELAY)
-            continue
-        
-        hit_rate = stats.hit_rate_2plus if threshold == 2 else stats.hit_rate_3plus if threshold == 3 else stats.hit_rate_4plus
-        if hit_rate < min_hit_rate:
-            time.sleep(REQUEST_DELAY)
-            continue
-        
-        info = game_info.get(player["team"])
-        if not info:
-            continue
-        
-        opp = info["opponent"]
-        opp_def = team_defense.get(opp)
-        if not opp_def:
-            continue
-        
-        is_home = info["home_away"] == "HOME"
-        
-        # H2H
-        h2h_shots = [stats.all_shots[j] for j, o in enumerate(stats.opponents) if o == opp]
-        h2h_avg = sum(h2h_shots) / len(h2h_shots) if h2h_shots else 0
-        
-        # Probabilities
-        adj_lambda = calculate_adjusted_lambda(stats, opp_def, is_home)
-        prob_2 = poisson_prob_at_least(adj_lambda, 2) * 100
-        prob_3 = poisson_prob_at_least(adj_lambda, 3) * 100
-        prob_4 = poisson_prob_at_least(adj_lambda, 4) * 100
-        
-        # Apply caps
-        main_prob = prob_2 if threshold == 2 else prob_3 if threshold == 3 else prob_4
-        capped_prob, was_capped, cap_reason = apply_probability_cap(main_prob, stats)
-        
-        if threshold == 2:
-            prob_2 = capped_prob
-        elif threshold == 3:
-            prob_3 = capped_prob
-        else:
-            prob_4 = capped_prob
-        
-        # Confidence
-        conf, edges, risks = calculate_confidence(stats, opp_def, is_home, threshold)
-        
-        if conf < min_confidence:
-            time.sleep(REQUEST_DELAY)
-            continue
-        
-        implied_odds = implied_prob_to_american(capped_prob / 100)
-        tier = get_tier(conf, hit_rate, stats)
-        
-        play = BettingPlay(
-            player=stats,
-            opponent=opp,
-            opponent_defense=opp_def,
-            home_away=info["home_away"],
-            game_time=info["time"],
-            game_id=info["game_id"],
-            h2h_avg=round(h2h_avg, 2),
-            h2h_games=len(h2h_shots),
-            prob_2plus=round(prob_2, 1),
-            prob_3plus=round(prob_3, 1),
-            prob_4plus=round(prob_4, 1),
-            confidence=conf,
-            tier=tier,
-            trend=get_trend_emoji(stats.last_5_avg, stats.avg_sog),
-            implied_odds=implied_odds,
-            edge_factors=edges,
-            risk_factors=risks,
-            prob_capped=was_capped,
-            cap_reason=cap_reason
-        )
-        betting_plays.append(play)
-        time.sleep(REQUEST_DELAY)
-    
-    progress.empty()
-    
-    if not betting_plays:
-        st.warning("No qualifying plays found!")
-        return []
-    
-    betting_plays.sort(key=lambda x: x.confidence, reverse=True)
-    display_results(betting_plays, threshold, date_str)
-    
-    return betting_plays
-
-def display_results(plays: List[BettingPlay], threshold: int, date_str: str):
-    st.subheader(f"🎯 Results - O{threshold - 0.5} SOG")
-    
-    # Summary
-    col1, col2, col3, col4, col5 = st.columns(5)
-    locks = len([p for p in plays if "LOCK" in p.tier])
-    strong = len([p for p in plays if "STRONG" in p.tier])
-    solid = len([p for p in plays if "SOLID" in p.tier])
-    capped = len([p for p in plays if p.prob_capped])
-    
-    col1.metric("🔒 Locks", locks)
-    col2.metric("✅ Strong", strong)
-    col3.metric("📊 Solid", solid)
-    col4.metric("🔻 Capped", capped)
-    col5.metric("Total", len(plays))
-    
-    # Table with V5.1 columns
-    data = []
-    for p in plays:
-        s = p.player
-        hit = s.hit_rate_2plus if threshold == 2 else s.hit_rate_3plus if threshold == 3 else s.hit_rate_4plus
-        prob = p.prob_2plus if threshold == 2 else p.prob_3plus if threshold == 3 else p.prob_4plus
-        cush = s.cushion_rate_2 if threshold == 2 else s.cushion_rate_3 if threshold == 3 else s.cushion_rate_4
-        
-        data.append({
-            "Tier": p.tier,
-            "Player": s.name,
-            "Team": s.team,
-            "vs": p.opponent,
-            "Hit%": f"{hit:.0f}%",
-            "Cush%": f"{cush:.0f}%",
-            "Shut%": f"{s.shutout_rate:.0f}%",
-            "Avg": s.avg_sog,
-            "L5": s.last_5_avg,
-            "SOG/60": s.sog_per_60,
-            "TOI": f"{s.avg_toi:.0f}m",
-            "TOI📈": s.toi_trend,
-            "σ": s.std_dev,
-            "PP": "⚡" if s.is_pp1 else "",
-            "Prob%": f"{prob:.0f}%",
-            "Cap": "🔻" if p.prob_capped else "",
-            "Conf": int(p.confidence),
-        })
-    
-    df = pd.DataFrame(data)
-    st.dataframe(df, use_container_width=True, hide_index=True,
-                 column_config={"Conf": st.column_config.ProgressColumn("Conf", min_value=0, max_value=100, format="%d")})
-    
-    # Export
-    csv = df.to_csv(index=False)
-    st.download_button("📥 Download", data=csv, file_name=f"nhl_sog_v51_{date_str}.csv", mime="text/csv")
-
-def show_parlays(plays: List[BettingPlay], threshold: int, unit_size: float):
-    st.header("🎯 Parlay Builder")
-    
-    legs = build_parlay_legs(plays, threshold)
-    quality = [l for l in legs if l.confidence >= 60 and l.our_prob >= 0.75]
-    
-    if not quality:
-        st.warning("Not enough quality plays")
-        return
-    
-    st.success(f"**{len(quality)}** quality plays available")
-    
-    for num_legs, config in PARLAY_CONFIG.items():
-        parlays = generate_parlays(quality, num_legs, 3)
-        if not parlays:
-            continue
-        
-        with st.expander(f"**{config['name']}** ({num_legs}-leg)", expanded=(num_legs == 2)):
-            for i, parlay in enumerate(parlays, 1):
-                st.markdown(f"**Option {i}** - {parlay.risk_level} Risk")
-                
-                col1, col2, col3 = st.columns(3)
-                col1.write(f"Prob: **{parlay.combined_prob * 100:.1f}%**")
-                col2.write(f"Odds: **{parlay.combined_odds:+d}**")
-                col3.write(f"Bet: **${unit_size * parlay.unit_size:.0f}**")
-                
-                leg_data = [{"Player": l.player_name, "Team": l.team, "Prob": f"{l.our_prob*100:.0f}%", "Conf": l.confidence} for l in parlay.legs]
-                st.dataframe(pd.DataFrame(leg_data), hide_index=True, use_container_width=True)
-                st.markdown("---")
-
-def show_defense():
-    st.header("🛡️ Team Defense")
-    
-    if st.button("🔄 Refresh"):
-        with st.spinner("Loading..."):
-            all_teams = get_all_teams()
-            team_defense = get_team_defense_stats(set(t["abbrev"] for t in all_teams))
-            
-            sorted_def = sorted(team_defense.values(), key=lambda x: x.shots_allowed_per_game, reverse=True)
-            
-            data = [{"Rank": i, "Team": t.team_abbrev, "SA/G": t.shots_allowed_per_game, "L5": t.shots_allowed_L5, "Grade": t.grade, "Trend": t.recent_trend} for i, t in enumerate(sorted_def, 1)]
-            st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
-
-def show_metrics_guide():
-    st.header("📈 V5.1 Metrics Guide")
-    
-    st.markdown("""
-    ## Rate-Based Metrics (The Key Improvement)
-    
-    | Metric | Formula | Why It Matters |
-    |--------|---------|----------------|
-    | **SOG/60** | (Shots / TOI) × 60 | Normalizes for ice time |
-    | **SOG/Shift** | Shots / Shifts | Efficiency per deployment |
-    | **Avg Shift Length** | (TOI × 60) / Shifts | Star players = longer shifts |
-    
-    ### Example: Two Players with 3.0 Avg SOG
-    
-    | Player | TOI | SOG/60 | Better Bet? |
-    |--------|-----|--------|-------------|
-    | Player A | 22 min | 8.2 | ❌ No (low rate) |
-    | Player B | 14 min | 12.9 | ✅ Yes (high rate) |
-    
-    Player B shoots at a much higher rate - if they get normal ice time, they'll exceed their average.
-    
-    ---
-    
-    ## Risk Metrics
-    
-    | Metric | What It Tells You |
-    |--------|-------------------|
-    | **Shutout Rate** | % of games with 0 SOG (true danger) |
-    | **Cushion Rate** | % clearing threshold+1 (comfortable wins) |
-    | **L5 Shutouts** | Recent shutouts (momentum indicator) |
-    | **P10 Floor** | 10th percentile (robust floor) |
-    
-    ---
-    
-    ## TOI Trend
-    
-    | Trend | Meaning |
-    |-------|---------|
-    | 📈 UP | L5 TOI > Season by 8%+ (role expanding) |
-    | 📉 DOWN | L5 TOI < Season by 8%+ (role shrinking) |
-    | ➡️ STABLE | Within ±8% |
-    
-    ---
-    
-    ## Probability Caps
-    
-    V5.1 caps probability to prevent overconfidence:
-    
-    | Condition | Max Prob |
-    |-----------|----------|
-    | Shutout rate > 8% | 82% |
-    | Std dev > 2.0 | 85% |
-    | Shutout in L5 | 80% |
-    | TOI dropping | 85% |
-    | < 20 games | 88% |
-    | Absolute max | 94% |
-    """)
+        show_results_tracker(threshold)
 
 if __name__ == "__main__":
     main()
