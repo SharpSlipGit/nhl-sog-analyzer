@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer v3.6
+NHL Shots on Goal Analyzer v3.8
 ===============================
-- PARLAY SCORE: 0-100 grade for parlay suitability
-- FASTER: Reduced API calls, smarter caching
+- BUST RATE: % of games with 0-1 SOG (replaces variance)
+- DEFENSE: 20 games, proper A-F grading, trend detection
+- RESULTS TRACKER: Export picks, fetch results, analyze performance
 - NO ODDS API: Uses model + hit rate only
-- NO INJURY TRACKING: L5 stats already capture TOI changes
 """
 
 import streamlit as st
@@ -14,7 +14,7 @@ import time
 import math
 import pandas as pd
 from typing import Optional, List, Dict, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import statistics
 
@@ -177,14 +177,14 @@ def calculate_parlay_score(player: Dict, opp_def: Dict, is_home: bool, threshold
     elif hit_rate >= 80: score += 10
     elif hit_rate >= 75: score += 5
     
-    # Consistency bonus - low std dev (up to 15 points)
-    # Low variance = predictable = better for parlays
-    std = player.get("std_dev", 2.0)
-    if std <= 0.8: score += 15
-    elif std <= 1.0: score += 12
-    elif std <= 1.3: score += 8
-    elif std <= 1.5: score += 5
-    elif std > 2.0: score -= 5  # High variance penalty
+    # Bust rate bonus/penalty (% of games with 0-1 SOG)
+    # Low bust rate = reliable, high bust rate = parlay killer
+    bust_rate = player.get("bust_rate", 10)
+    if bust_rate < 5: score += 10      # Elite - rarely busts
+    elif bust_rate < 8: score += 5     # Good
+    elif bust_rate < 12: score += 0    # Average
+    elif bust_rate < 18: score -= 5    # Concerning
+    else: score -= 10                   # High risk - often busts
     
     # Floor bonus (up to 10 points)
     # Floor >= 1 means player NEVER gets shutout
@@ -453,6 +453,10 @@ def fetch_player_stats_fast(player_info: Dict) -> Optional[Dict]:
         home_avg = sum(home_shots) / len(home_shots) if home_shots else avg
         away_avg = sum(away_shots) / len(away_shots) if away_shots else avg
         
+        # Bust rate = % of games with 0-1 SOG (parlay killers)
+        bust_games = sum(1 for s in all_shots if s <= 1)
+        bust_rate = (bust_games / gp) * 100
+        
         # Estimate PP1 from PP goals and volume
         is_pp1 = (pp_goals >= 3 and avg >= 2.5) or (pp_goals >= 5)
         
@@ -481,6 +485,7 @@ def fetch_player_stats_fast(player_info: Dict) -> Optional[Dict]:
             "current_streak": streak,
             "home_avg": round(home_avg, 2),
             "away_avg": round(away_avg, 2),
+            "bust_rate": round(bust_rate, 1),
             "is_pp1": is_pp1,
             "is_b2b": is_b2b,
             "pp_goals": pp_goals,
@@ -564,14 +569,36 @@ def show_model_explanation():
             | Factor | Max Points |
             |--------|------------|
             | Hit Rate (95%+) | +25 |
-            | Consistency (σ < 1) | +15 |
-            | Floor ≥ 1 | +7 to +10 |
+            | Low Bust Rate (<5%) | +10 |
+            | Floor ≥ 2 | +10 |
             | Volume (4+ avg) | +10 |
             | Soft Matchup (A+) | +10 |
             | PP1 Player | +8 |
             | 🔥 Hot Trend | +5 |
             | Def Loosening 📈 | +4 |
             | Home | +2 |
+            
+            ### Bust Rate (% games 0-1 SOG)
+            | Bust% | Points | Risk |
+            |-------|--------|------|
+            | <5% | +10 | Elite |
+            | 5-8% | +5 | Good |
+            | 8-12% | 0 | Avg |
+            | 12-18% | -5 | Risky |
+            | >18% | -10 | Danger |
+            """)
+        with col2:
+            st.markdown("""
+            ### Penalties
+            
+            | Factor | Points |
+            |--------|--------|
+            | High Bust Rate (>18%) | -10 |
+            | ❄️ Cold Trend | -8 |
+            | Tough Matchup (F) | -8 |
+            | Tough Matchup (D) | -5 |
+            | Def Tightening 📉 | -4 |
+            | Back-to-Back | -3 |
             
             ### Defense Grades (SA/G)
             | Grade | SA/G | Meaning |
@@ -582,31 +609,9 @@ def show_model_explanation():
             | C | 28-30 | Average |
             | D | 26-28 | Tough |
             | F | <26 | Very tough |
-            """)
-        with col2:
-            st.markdown("""
-            ### Penalties
-            
-            | Factor | Points |
-            |--------|--------|
-            | ❄️ Cold Trend | -8 |
-            | Tough Matchup (F) | -8 |
-            | High Variance (σ > 2) | -5 |
-            | Tough Matchup (D) | -5 |
-            | Def Tightening 📉 | -4 |
-            | Back-to-Back | -3 |
-            
-            ### Parlay Grades
-            | Grade | Score | Meaning |
-            |-------|-------|---------|
-            | A+ | 85+ | Elite leg |
-            | A | 75-84 | Excellent |
-            | B+ | 65-74 | Good |
-            | B | 55-64 | Average |
-            | C/D | <55 | Risky |
             
             ### Defense Trend
-            - 📈 = Loosening (allowing more shots)
+            - 📈 = Loosening (allowing more)
             - 📉 = Tightening (allowing fewer)
             """)
 
@@ -615,7 +620,7 @@ def show_model_explanation():
 # ============================================================================
 def main():
     st.title("🏒 NHL SOG Analyzer")
-    st.caption("v3.6 | Parlay Score System")
+    st.caption("v3.8 | Bust Rate + Results Tracker")
     
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -640,7 +645,7 @@ def main():
         st.markdown("---")
         st.caption(f"{get_est_datetime().strftime('%I:%M %p EST')}")
     
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 All Results", "🎯 Best Bets", "🎰 Parlays", "❓ Help"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 All Results", "🎯 Best Bets", "🎰 Parlays", "📈 Track Results", "❓ Help"])
     
     if 'all_plays' not in st.session_state:
         st.session_state.all_plays = []
@@ -648,6 +653,8 @@ def main():
         st.session_state.games = []
     if 'threshold' not in st.session_state:
         st.session_state.threshold = 2
+    if 'tracking_data' not in st.session_state:
+        st.session_state.tracking_data = []
     
     with tab1:
         if run_analysis:
@@ -677,6 +684,9 @@ def main():
             st.info("Run analysis first")
     
     with tab4:
+        show_results_tracker(date_str, threshold)
+    
+    with tab5:
         show_help()
 
 def run_fast_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[Dict]]:
@@ -849,7 +859,7 @@ def display_all_results(plays: List[Dict], threshold: int, date_str: str):
             "Hit%": p[hit_key],
             "Avg": p["avg_sog"],
             "L5": p["last_5_avg"],
-            "σ": p["std_dev"],
+            "Bust%": p.get("bust_rate", 0),
             "Floor": p["floor"],
             "Trend": play["trend"],
             "Def": def_display,
@@ -995,6 +1005,369 @@ def show_parlays(plays: List[Dict], games: List[Dict], threshold: int, unit_size
                 copy_text += "─"*30 + f"\nOdds: {sgp['american_odds']:+d} | Avg Score: {avg_score:.0f}\n"
                 st.code(copy_text, language=None)
 
+def show_results_tracker(date_str: str, threshold: int):
+    st.header("📈 Results Tracker")
+    
+    # Initialize session state for tracking
+    if 'saved_picks' not in st.session_state:
+        st.session_state.saved_picks = {}  # {date: [picks]}
+    if 'results_history' not in st.session_state:
+        st.session_state.results_history = []  # Combined history
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("1️⃣ Today's Picks")
+        
+        # Auto-save picks when analysis runs
+        if st.session_state.all_plays:
+            current_date = date_str
+            picks_for_date = []
+            
+            prob_key = f"prob_{st.session_state.threshold}plus"
+            hit_key = f"hit_rate_{st.session_state.threshold}plus"
+            
+            for play in st.session_state.all_plays:
+                p = play["player"]
+                picks_for_date.append({
+                    "date": current_date,
+                    "player": p["name"],
+                    "player_id": p["player_id"],
+                    "team": p["team"],
+                    "opponent": play["opponent"],
+                    "threshold": st.session_state.threshold,
+                    "parlay_score": play["parlay_score"],
+                    "parlay_grade": play["parlay_grade"],
+                    "model_prob": round(play[prob_key], 1),
+                    "hit_rate": round(p[hit_key], 1),
+                    "is_qualified": play["is_qualified"],
+                    "actual_sog": None,
+                    "hit": None
+                })
+            
+            st.session_state.saved_picks[current_date] = picks_for_date
+            st.success(f"✅ {len(picks_for_date)} picks saved for {current_date}")
+            
+            # Show summary
+            qualified = [p for p in picks_for_date if p["is_qualified"]]
+            st.metric("Qualified Picks", len(qualified))
+            st.metric("Total Analyzed", len(picks_for_date))
+        else:
+            st.info("Run analysis to save picks")
+    
+    with col2:
+        st.subheader("2️⃣ Check Results")
+        
+        # Select date to check
+        saved_dates = list(st.session_state.saved_picks.keys())
+        if saved_dates:
+            check_date = st.selectbox("Select date to check", saved_dates, index=len(saved_dates)-1)
+        else:
+            check_date = st.date_input("Date", value=get_est_datetime().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        if st.button("🔍 Check Results", type="primary", use_container_width=True):
+            with st.spinner("Fetching box scores..."):
+                check_and_update_results(check_date, st.session_state.threshold)
+    
+    st.markdown("---")
+    
+    # Show results for selected date
+    st.subheader("📊 Results Report")
+    
+    if saved_dates:
+        report_date = st.selectbox("View report for", saved_dates, key="report_date")
+        show_date_report(report_date, st.session_state.threshold)
+    else:
+        st.info("No picks saved yet. Run analysis first.")
+    
+    st.markdown("---")
+    
+    # Running totals
+    st.subheader("📈 Running Totals")
+    show_running_totals()
+    
+    st.markdown("---")
+    
+    # Import/Export
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("💾 Export History")
+        if st.session_state.saved_picks:
+            all_picks = []
+            for date_picks in st.session_state.saved_picks.values():
+                all_picks.extend(date_picks)
+            
+            if all_picks:
+                df = pd.DataFrame(all_picks)
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    "📥 Download All History",
+                    data=csv,
+                    file_name=f"nhl_sog_history_{get_est_date()}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+                st.caption(f"{len(all_picks)} total picks across {len(st.session_state.saved_picks)} days")
+    
+    with col2:
+        st.subheader("📤 Import History")
+        uploaded = st.file_uploader("Upload previous history CSV", type="csv")
+        if uploaded:
+            try:
+                df = pd.read_csv(uploaded)
+                # Group by date and restore to saved_picks
+                for date in df["date"].unique():
+                    date_df = df[df["date"] == date]
+                    st.session_state.saved_picks[date] = date_df.to_dict("records")
+                st.success(f"✅ Imported {len(df)} picks from {df['date'].nunique()} days")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error importing: {e}")
+
+
+def check_and_update_results(check_date: str, threshold: int):
+    """Fetch actual results and update saved picks."""
+    
+    if check_date not in st.session_state.saved_picks:
+        st.warning(f"No picks saved for {check_date}")
+        return
+    
+    picks = st.session_state.saved_picks[check_date]
+    
+    # Build lookup of player_id to pick
+    pick_lookup = {p["player_id"]: p for p in picks}
+    
+    # Fetch games for that date
+    games = get_todays_schedule(check_date)
+    
+    if not games:
+        st.error(f"No games found for {check_date}")
+        return
+    
+    results_found = 0
+    
+    for game in games:
+        try:
+            box_url = f"{NHL_WEB_API}/gamecenter/{game['id']}/boxscore"
+            resp = requests.get(box_url, timeout=15)
+            
+            if resp.status_code != 200:
+                continue
+            
+            box_data = resp.json()
+            
+            # Check game state
+            game_state = box_data.get("gameState", "")
+            if game_state not in ["OFF", "FINAL"]:
+                continue  # Game not finished
+            
+            # Get player stats
+            for team_key in ["homeTeam", "awayTeam"]:
+                for player_type in ["forwards", "defense"]:
+                    players = box_data.get("boxscore", {}).get("playerByGameStats", {}).get(team_key, {}).get(player_type, [])
+                    
+                    for player in players:
+                        pid = player.get("playerId")
+                        if pid and pid in pick_lookup:
+                            actual_sog = player.get("sog", 0)
+                            pick_lookup[pid]["actual_sog"] = actual_sog
+                            pick_lookup[pid]["hit"] = 1 if actual_sog >= threshold else 0
+                            results_found += 1
+            
+            time.sleep(0.05)
+            
+        except Exception as e:
+            continue
+    
+    # Update session state
+    st.session_state.saved_picks[check_date] = list(pick_lookup.values())
+    
+    st.success(f"✅ Updated {results_found} picks with actual results")
+
+
+def show_date_report(report_date: str, threshold: int):
+    """Show detailed report for a specific date."""
+    
+    if report_date not in st.session_state.saved_picks:
+        st.info("No data for this date")
+        return
+    
+    picks = st.session_state.saved_picks[report_date]
+    
+    # Check if we have results
+    has_results = any(p.get("actual_sog") is not None for p in picks)
+    
+    if not has_results:
+        st.warning("⏳ Results not checked yet. Click 'Check Results' above.")
+        # Still show picks without results
+        df = pd.DataFrame(picks)[["player", "team", "opponent", "parlay_grade", "model_prob", "is_qualified"]]
+        df["is_qualified"] = df["is_qualified"].apply(lambda x: "✅" if x else "")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        return
+    
+    # Split qualified vs non-qualified
+    qualified = [p for p in picks if p.get("is_qualified")]
+    non_qualified = [p for p in picks if not p.get("is_qualified")]
+    
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    q_with_results = [p for p in qualified if p.get("hit") is not None]
+    nq_with_results = [p for p in non_qualified if p.get("hit") is not None]
+    
+    q_hits = sum(p.get("hit", 0) for p in q_with_results)
+    q_total = len(q_with_results)
+    nq_hits = sum(p.get("hit", 0) for p in nq_with_results)
+    nq_total = len(nq_with_results)
+    
+    q_rate = (q_hits / q_total * 100) if q_total > 0 else 0
+    nq_rate = (nq_hits / nq_total * 100) if nq_total > 0 else 0
+    
+    col1.metric("✅ Qualified Hits", f"{q_hits}/{q_total}", f"{q_rate:.0f}%")
+    col2.metric("⚠️ Non-Qual Hits", f"{nq_hits}/{nq_total}", f"{nq_rate:.0f}%")
+    col3.metric("Total Hits", f"{q_hits + nq_hits}/{q_total + nq_total}")
+    col4.metric("Threshold", f"O{threshold - 0.5} ({threshold}+ SOG)")
+    
+    # Qualified picks table
+    st.markdown("### ✅ Qualified Picks")
+    if q_with_results:
+        q_df = pd.DataFrame(q_with_results)
+        q_df = q_df[["player", "team", "opponent", "parlay_grade", "parlay_score", "model_prob", "actual_sog", "hit"]]
+        q_df["hit"] = q_df["hit"].apply(lambda x: "✅ HIT" if x == 1 else "❌ MISS" if x == 0 else "⏳")
+        q_df = q_df.sort_values("parlay_score", ascending=False)
+        st.dataframe(q_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No qualified picks with results")
+    
+    # Non-qualified picks table (collapsed)
+    with st.expander(f"⚠️ Non-Qualified Picks ({nq_total} players)"):
+        if nq_with_results:
+            nq_df = pd.DataFrame(nq_with_results)
+            nq_df = nq_df[["player", "team", "opponent", "parlay_grade", "parlay_score", "model_prob", "actual_sog", "hit"]]
+            nq_df["hit"] = nq_df["hit"].apply(lambda x: "✅ HIT" if x == 1 else "❌ MISS" if x == 0 else "⏳")
+            nq_df = nq_df.sort_values("parlay_score", ascending=False)
+            st.dataframe(nq_df, use_container_width=True, hide_index=True)
+    
+    # Grade breakdown
+    st.markdown("### 📊 Performance by Grade")
+    grade_stats = []
+    for grade in ["A+", "A", "B+", "B", "C", "D"]:
+        grade_picks = [p for p in picks if p.get("parlay_grade") == grade and p.get("hit") is not None]
+        if grade_picks:
+            hits = sum(p.get("hit", 0) for p in grade_picks)
+            total = len(grade_picks)
+            rate = hits / total * 100 if total > 0 else 0
+            grade_stats.append({
+                "Grade": grade,
+                "Hits": hits,
+                "Total": total,
+                "Hit Rate": f"{rate:.0f}%"
+            })
+    
+    if grade_stats:
+        st.dataframe(pd.DataFrame(grade_stats), use_container_width=True, hide_index=True)
+
+
+def show_running_totals():
+    """Show cumulative performance across all tracked days."""
+    
+    if not st.session_state.saved_picks:
+        st.info("No history yet. Track some picks first!")
+        return
+    
+    # Aggregate all picks
+    all_picks = []
+    for date_picks in st.session_state.saved_picks.values():
+        all_picks.extend(date_picks)
+    
+    # Filter to picks with results
+    with_results = [p for p in all_picks if p.get("hit") is not None]
+    
+    if not with_results:
+        st.warning("No results checked yet. Check results for your saved dates.")
+        st.caption(f"You have picks saved for: {', '.join(st.session_state.saved_picks.keys())}")
+        return
+    
+    # Overall stats
+    qualified = [p for p in with_results if p.get("is_qualified")]
+    non_qualified = [p for p in with_results if not p.get("is_qualified")]
+    
+    q_hits = sum(p.get("hit", 0) for p in qualified)
+    q_total = len(qualified)
+    nq_hits = sum(p.get("hit", 0) for p in non_qualified)
+    nq_total = len(non_qualified)
+    
+    total_hits = q_hits + nq_hits
+    total_picks = q_total + nq_total
+    
+    st.markdown("### 🏆 All-Time Performance")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    q_rate = (q_hits / q_total * 100) if q_total > 0 else 0
+    nq_rate = (nq_hits / nq_total * 100) if nq_total > 0 else 0
+    total_rate = (total_hits / total_picks * 100) if total_picks > 0 else 0
+    
+    col1.metric("✅ Qualified", f"{q_hits}/{q_total}", f"{q_rate:.1f}%")
+    col2.metric("⚠️ Non-Qualified", f"{nq_hits}/{nq_total}", f"{nq_rate:.1f}%")
+    col3.metric("📊 Overall", f"{total_hits}/{total_picks}", f"{total_rate:.1f}%")
+    col4.metric("📅 Days Tracked", len(st.session_state.saved_picks))
+    
+    # Performance by grade (all-time)
+    st.markdown("### 📊 All-Time by Grade")
+    grade_stats = []
+    for grade in ["A+", "A", "B+", "B", "C", "D"]:
+        grade_picks = [p for p in with_results if p.get("parlay_grade") == grade]
+        if grade_picks:
+            hits = sum(p.get("hit", 0) for p in grade_picks)
+            total = len(grade_picks)
+            rate = hits / total * 100 if total > 0 else 0
+            avg_prob = sum(p.get("model_prob", 0) for p in grade_picks) / total
+            grade_stats.append({
+                "Grade": grade,
+                "Hits": hits,
+                "Total": total,
+                "Hit Rate": f"{rate:.1f}%",
+                "Avg Model%": f"{avg_prob:.1f}%",
+                "Calibration": f"{rate - avg_prob:+.1f}%" if total >= 5 else "N/A"
+            })
+    
+    if grade_stats:
+        st.dataframe(pd.DataFrame(grade_stats), use_container_width=True, hide_index=True)
+        
+        # Key insight
+        a_plus = [p for p in with_results if p.get("parlay_grade") == "A+"]
+        if len(a_plus) >= 3:
+            a_plus_rate = sum(p.get("hit", 0) for p in a_plus) / len(a_plus) * 100
+            if a_plus_rate >= 85:
+                st.success(f"🏆 A+ grade is hitting at **{a_plus_rate:.0f}%** - Model working well!")
+            elif a_plus_rate >= 75:
+                st.info(f"📊 A+ grade is hitting at **{a_plus_rate:.0f}%** - Solid performance")
+            else:
+                st.warning(f"⚠️ A+ grade is only hitting at **{a_plus_rate:.0f}%** - May need to tighten criteria")
+    
+    # Daily breakdown
+    with st.expander("📅 Daily Breakdown"):
+        daily_stats = []
+        for date, picks in st.session_state.saved_picks.items():
+            picks_with_results = [p for p in picks if p.get("hit") is not None]
+            if picks_with_results:
+                q_picks = [p for p in picks_with_results if p.get("is_qualified")]
+                q_hits = sum(p.get("hit", 0) for p in q_picks)
+                total_hits = sum(p.get("hit", 0) for p in picks_with_results)
+                daily_stats.append({
+                    "Date": date,
+                    "Qualified": f"{q_hits}/{len(q_picks)}" if q_picks else "0/0",
+                    "Q Rate": f"{q_hits/len(q_picks)*100:.0f}%" if q_picks else "-",
+                    "Total": f"{total_hits}/{len(picks_with_results)}",
+                    "Total Rate": f"{total_hits/len(picks_with_results)*100:.0f}%"
+                })
+        
+        if daily_stats:
+            st.dataframe(pd.DataFrame(daily_stats), use_container_width=True, hide_index=True)
+
+
 def show_help():
     st.header("❓ Help")
     show_model_explanation()
@@ -1006,21 +1379,32 @@ def show_help():
     
     **Higher score = better parlay leg** because:
     - High hit rate (historically delivers)
-    - Low variance (consistent, not boom/bust)
+    - Low bust rate (rarely gets 0-1 SOG)
     - High floor (never gets completely shut out)
     - Good volume (averages lots of shots)
     
-    ## Why Not Just Use Probability?
+    ## What is Bust Rate?
     
-    Probability tells you *likelihood* of hitting.
+    **Bust Rate = % of games with 0-1 SOG**
     
-    Parlay Score tells you *reliability* for parlays.
+    This is the key parlay killer metric. Even stars have bad games.
     
-    **Example:**
-    - Player A: 88% prob, but σ=2.5 (inconsistent)
-    - Player B: 85% prob, but σ=0.9 (very consistent)
+    | Player | Avg | Bust% | Risk Level |
+    |--------|-----|-------|------------|
+    | Elite | 4.0 | 3% | Very safe |
+    | Good | 3.5 | 8% | Safe |
+    | Average | 3.0 | 15% | Some risk |
+    | Risky | 2.5 | 25% | Parlay killer |
     
-    Player B is better for parlays despite lower probability!
+    ## Why Bust Rate > Variance?
+    
+    **Old approach (variance σ):**
+    - MacKinnon σ=2.2 → PENALIZED
+    - But his variance is UPSIDE (7-10 SOG games)
+    
+    **New approach (bust rate):**
+    - MacKinnon bust rate ~5% → REWARDED
+    - Only measures DOWNSIDE risk
     
     ## Grade Meanings
     
@@ -1042,11 +1426,41 @@ def show_help():
     | 🔥5G | 5+ game hit streak |
     | B2B | Back-to-back game |
     
+    ## Defense Column
+    
+    | Display | Meaning |
+    |---------|---------|
+    | A+ | Very easy defense (allows 34+ SA/G) |
+    | A📈 | Easy + getting worse (loosening) |
+    | C📉 | Average + getting better (tightening) |
+    | F | Very tough (allows <26 SA/G) |
+    
+    ## 📈 Tracking Results
+    
+    ### Workflow
+    1. **Before games**: Go to Track Results tab → Export picks
+    2. **After games**: Fetch actual results
+    3. **In Excel/Sheets**: Combine picks + results
+    4. **Upload**: Upload combined file to analyze
+    
+    ### What We Track
+    - Hit rate by Parlay Grade (A+, A, B+, etc.)
+    - Hit rate by Threshold (O1.5, O2.5, O3.5)
+    - Model calibration (predicted vs actual)
+    
+    ### Improving the Model
+    If tracking shows:
+    - **A+ grades hitting <85%** → Scoring is too generous
+    - **Model overconfident** → Reduce probability boosts
+    - **Model underconfident** → Increase probability boosts
+    - **High bust rate players hitting** → Reduce bust penalty
+    
     ## Recommended Strategy
     
     1. **2-3 leg parlays**: Use A+ and A grade players only
     2. **4-5 leg parlays**: Mix A+ with B+ players
     3. **6+ leg parlays**: Higher risk, use carefully
+    4. **Track everything**: Export picks, check results, improve over time
     """)
 
 if __name__ == "__main__":
