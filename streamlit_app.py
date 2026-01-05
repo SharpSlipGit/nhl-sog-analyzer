@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer v3.4
+NHL Shots on Goal Analyzer v3.5
 ===============================
-SPEED OPTIMIZATIONS:
-- Parallel player fetching (ThreadPoolExecutor)
-- Reduced defense games (5 instead of 10)
-- Combined API calls where possible
-- Smarter caching (longer TTL)
-
-MODEL IMPROVEMENTS:
-- Position factor (F vs D)
-- Back-to-back detection
-- Opponent L5 trending
-- Floor reliability bonus
-- Ceiling upside factor
+SPEED: Asyncio for parallel API calls
+ODDS: Real sportsbook odds from The Odds API
+EDGE: Vegas implied % vs Model % comparison
 """
 
 import streamlit as st
@@ -40,61 +31,48 @@ st.set_page_config(
 # CONFIGURATION
 # ============================================================================
 NHL_WEB_API = "https://api-web.nhle.com/v1"
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 SEASON = "20242025"
 GAME_TYPE = 2
 MIN_GAMES = 8
 MIN_HIT_RATE = 75
 EST = pytz.timezone('US/Eastern')
 
-# Speed settings
-DEFENSE_GAMES = 5  # Reduced from 10
-CACHE_TTL_DEFENSE = 1800  # 30 min cache for defense
-CACHE_TTL_SCHEDULE = 300  # 5 min cache for schedule
+DEFENSE_GAMES = 5
+CACHE_TTL = 1800
 
 MATCHUP_GRADES = {
     "A+": 33.0, "A": 32.0, "B+": 31.0, "B": 30.0,
     "C+": 29.0, "C": 28.0, "D": 27.0, "F": 0.0,
 }
 
+# Preferred sportsbooks in order
+PREFERRED_BOOKS = ["hardrock", "hardrockbet", "draftkings", "fanduel", "betmgm", "caesars"]
+
 # ============================================================================
-# IMPROVED MODEL WEIGHTS
+# MODEL WEIGHTS
 # ============================================================================
 MODEL_WEIGHTS = {
-    # Base calculation weights
-    "l5_weight": 0.45,      # Increased recent form importance
+    "l5_weight": 0.45,
     "l10_weight": 0.30,
-    "season_weight": 0.25,  # Reduced season weight
-    
-    # Hit rate multipliers (more aggressive tiers)
+    "season_weight": 0.25,
     "hit_rate_95_boost": 1.15,
     "hit_rate_90_boost": 1.12,
     "hit_rate_85_boost": 1.08,
     "hit_rate_80_boost": 1.04,
-    
-    # Power play
     "pp1_boost": 1.18,
     "pp2_boost": 1.08,
-    
-    # Situational
     "home_boost": 1.03,
     "away_penalty": 0.97,
     "hot_streak_boost": 1.06,
-    "cold_streak_penalty": 0.90,  # More aggressive cold penalty
-    
-    # NEW: Position factors (forwards shoot more)
+    "cold_streak_penalty": 0.90,
     "forward_boost": 1.02,
     "defense_penalty": 0.96,
-    
-    # NEW: Reliability factors (only bonus, no penalty - 0 floor is normal)
-    "high_floor_1_boost": 1.04,  # Floor >= 1 (rare)
-    "high_floor_2_boost": 1.06,  # Floor >= 2 (very rare)
-    
-    # NEW: Back-to-back
-    "b2b_penalty": 0.94,  # Second game of back-to-back
-    
-    # NEW: Opponent trending
-    "opp_loosening_boost": 1.04,  # Defense getting worse
-    "opp_tightening_penalty": 0.96,  # Defense improving
+    "high_floor_1_boost": 1.04,
+    "high_floor_2_boost": 1.06,
+    "b2b_penalty": 0.94,
+    "opp_loosening_boost": 1.04,
+    "opp_tightening_penalty": 0.96,
 }
 
 # ============================================================================
@@ -103,85 +81,221 @@ MODEL_WEIGHTS = {
 def get_est_datetime():
     return datetime.now(EST)
 
-def implied_prob_to_american(prob: float) -> int:
-    if prob <= 0:
-        return 10000
-    if prob >= 1:
-        return -10000
-    if prob >= 0.5:
-        return int(-100 * prob / (1 - prob))
+def american_to_implied_prob(odds: int) -> float:
+    """Convert American odds to implied probability."""
+    if odds > 0:
+        return 100 / (odds + 100)
     else:
-        return int(100 * (1 - prob) / prob)
+        return abs(odds) / (abs(odds) + 100)
+
+def implied_prob_to_american(prob: float) -> int:
+    if prob <= 0: return 10000
+    if prob >= 1: return -10000
+    if prob >= 0.5: return int(-100 * prob / (1 - prob))
+    return int(100 * (1 - prob) / prob)
 
 def calculate_parlay_odds(probs: List[float]) -> Tuple[float, int]:
-    combined_prob = 1.0
-    for p in probs:
-        combined_prob *= p
-    return combined_prob, implied_prob_to_american(combined_prob)
+    combined = 1.0
+    for p in probs: combined *= p
+    return combined, implied_prob_to_american(combined)
 
 def calculate_parlay_payout(odds: int, stake: float = 100) -> float:
-    if odds > 0:
-        return stake + (stake * odds / 100)
-    else:
-        return stake + (stake * 100 / abs(odds))
+    if odds > 0: return stake + (stake * odds / 100)
+    return stake + (stake * 100 / abs(odds))
 
 def poisson_prob_at_least(lam: float, k: int) -> float:
-    if lam <= 0:
-        return 0.0
-    prob_less = sum((math.exp(-lam) * (lam ** i)) / math.factorial(i) for i in range(k))
-    return 1 - prob_less
+    if lam <= 0: return 0.0
+    return 1 - sum((math.exp(-lam) * (lam ** i)) / math.factorial(i) for i in range(k))
 
 def get_grade(sa_pg: float) -> str:
     for grade, threshold in MATCHUP_GRADES.items():
-        if sa_pg >= threshold:
-            return grade
+        if sa_pg >= threshold: return grade
     return "F"
 
 def get_trend(l5: float, season: float) -> Tuple[str, bool, bool]:
     diff = l5 - season
-    if diff >= 0.5:
-        return "🔥", True, False
-    elif diff <= -0.5:
-        return "❄️", False, True
+    if diff >= 0.5: return "🔥", True, False
+    if diff <= -0.5: return "❄️", False, True
     return "➡️", False, False
 
 def get_tags(player: Dict) -> str:
     tags = []
-    if player["floor"] >= 1:
-        tags.append("🛡️")
-    if player["is_pp1"]:
-        tags.append("⚡")
-    if player["current_streak"] >= 5:
-        tags.append(f"🔥{player['current_streak']}G")
-    if player.get("is_b2b"):
-        tags.append("B2B")
+    if player["floor"] >= 1: tags.append("🛡️")
+    if player["is_pp1"]: tags.append("⚡")
+    if player["current_streak"] >= 5: tags.append(f"🔥{player['current_streak']}G")
+    if player.get("is_b2b"): tags.append("B2B")
     return " ".join(tags)
 
 def get_status_icon(hit_rate: float, is_cold: bool) -> Tuple[bool, str]:
-    if hit_rate >= 85 and not is_cold:
-        return True, "✅"
-    else:
-        return False, "⚠️"
+    if hit_rate >= 85 and not is_cold: return True, "✅"
+    return False, "⚠️"
 
-def format_parlay_text(legs: List[Dict], threshold: int, parlay_name: str, prob: float, odds: int) -> str:
-    text = f"🏒 NHL {parlay_name}\n"
-    text += "─" * 30 + "\n"
+def format_parlay_text(legs: List[Dict], threshold: int, name: str, prob: float, odds: int) -> str:
+    text = f"🏒 NHL {name}\n" + "─" * 30 + "\n"
     for p in legs:
         player = p["player"]
-        hit_rate = player[f"hit_rate_{threshold}plus"]
         status = "✅" if p["is_qualified"] else "⚠️"
         text += f"{status} {player['name']} ({player['team']})\n"
-        text += f"   O{threshold-0.5} SOG | {hit_rate:.0f}% hit rate\n"
-    text += "─" * 30 + "\n"
-    text += f"Prob: {prob*100:.0f}% | Odds: {odds:+d}\n"
+        text += f"   O{threshold-0.5} SOG | {player[f'hit_rate_{threshold}plus']:.0f}% hit rate\n"
+    text += "─" * 30 + f"\nProb: {prob*100:.0f}% | Odds: {odds:+d}\n"
     return text
 
+def normalize_name(name: str) -> str:
+    """Normalize player name for matching."""
+    return name.lower().replace(".", "").replace("-", " ").strip()
+
 # ============================================================================
-# OPTIMIZED API FUNCTIONS
+# ODDS API FUNCTIONS
 # ============================================================================
-@st.cache_data(ttl=CACHE_TTL_SCHEDULE)
+def fetch_nhl_events(api_key: str) -> List[Dict]:
+    """Fetch today's NHL events from The Odds API."""
+    if not api_key:
+        return []
+    
+    url = f"{ODDS_API_BASE}/sports/icehockey_nhl/events"
+    try:
+        resp = requests.get(url, params={"apiKey": api_key}, timeout=15)
+        if resp.status_code == 200:
+            return resp.json()
+        return []
+    except:
+        return []
+
+def fetch_player_props(api_key: str, event_id: str) -> Dict[str, Dict]:
+    """Fetch SOG props for an event. Returns {player_name: {line, odds, book}}"""
+    if not api_key:
+        return {}
+    
+    url = f"{ODDS_API_BASE}/sports/icehockey_nhl/events/{event_id}/odds"
+    params = {
+        "apiKey": api_key,
+        "regions": "us",
+        "markets": "player_shots_on_goal",
+        "oddsFormat": "american"
+    }
+    
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code != 200:
+            return {}
+        
+        data = resp.json()
+        player_odds = {}
+        
+        for bookmaker in data.get("bookmakers", []):
+            book_key = bookmaker.get("key", "").lower()
+            
+            # Check if this is a preferred book
+            book_priority = 999
+            for i, pref in enumerate(PREFERRED_BOOKS):
+                if pref in book_key:
+                    book_priority = i
+                    break
+            
+            for market in bookmaker.get("markets", []):
+                if market.get("key") != "player_shots_on_goal":
+                    continue
+                
+                for outcome in market.get("outcomes", []):
+                    player_name = outcome.get("description", "")
+                    line = outcome.get("point", 0)
+                    price = outcome.get("price", 0)
+                    outcome_type = outcome.get("name", "")  # "Over" or "Under"
+                    
+                    if outcome_type != "Over":
+                        continue
+                    
+                    normalized = normalize_name(player_name)
+                    
+                    # Only update if this book is higher priority
+                    if normalized not in player_odds or book_priority < player_odds[normalized].get("priority", 999):
+                        player_odds[normalized] = {
+                            "name": player_name,
+                            "line": line,
+                            "odds": price,
+                            "book": bookmaker.get("title", book_key),
+                            "priority": book_priority
+                        }
+        
+        return player_odds
+    except Exception as e:
+        return {}
+
+def fetch_all_odds(api_key: str, status_text=None) -> Dict[str, Dict]:
+    """Fetch all SOG odds for today's games."""
+    if not api_key:
+        return {}
+    
+    all_odds = {}
+    
+    if status_text:
+        status_text.text("📊 Fetching sportsbook odds...")
+    
+    events = fetch_nhl_events(api_key)
+    
+    for event in events:
+        event_id = event.get("id")
+        if not event_id:
+            continue
+        
+        props = fetch_player_props(api_key, event_id)
+        all_odds.update(props)
+    
+    return all_odds
+
+# ============================================================================
+# PROBABILITY MODEL
+# ============================================================================
+def calculate_model_probability(player: Dict, opp_def: Dict, is_home: bool, threshold: int) -> float:
+    base_lambda = (
+        player["last_5_avg"] * MODEL_WEIGHTS["l5_weight"] +
+        player["last_10_avg"] * MODEL_WEIGHTS["l10_weight"] +
+        player["avg_sog"] * MODEL_WEIGHTS["season_weight"]
+    )
+    
+    hit_rate = player[f"hit_rate_{threshold}plus"]
+    if hit_rate >= 95: hr_factor = MODEL_WEIGHTS["hit_rate_95_boost"]
+    elif hit_rate >= 90: hr_factor = MODEL_WEIGHTS["hit_rate_90_boost"]
+    elif hit_rate >= 85: hr_factor = MODEL_WEIGHTS["hit_rate_85_boost"]
+    elif hit_rate >= 80: hr_factor = MODEL_WEIGHTS["hit_rate_80_boost"]
+    else: hr_factor = 1.0
+    
+    if player["is_pp1"]: pp_factor = MODEL_WEIGHTS["pp1_boost"]
+    elif player["pp_toi"] > 1.0: pp_factor = MODEL_WEIGHTS["pp2_boost"]
+    else: pp_factor = 1.0
+    
+    ha_factor = MODEL_WEIGHTS["home_boost"] if is_home else MODEL_WEIGHTS["away_penalty"]
+    
+    opp_sa = opp_def.get("shots_allowed_per_game", 30.0)
+    opp_factor = opp_sa / 30.0
+    
+    opp_trend = opp_def.get("trend", "stable")
+    if opp_trend == "loosening": opp_factor *= MODEL_WEIGHTS["opp_loosening_boost"]
+    elif opp_trend == "tightening": opp_factor *= MODEL_WEIGHTS["opp_tightening_penalty"]
+    
+    trend, is_hot, is_cold = get_trend(player["last_5_avg"], player["avg_sog"])
+    if is_hot: streak_factor = MODEL_WEIGHTS["hot_streak_boost"]
+    elif is_cold: streak_factor = MODEL_WEIGHTS["cold_streak_penalty"]
+    else: streak_factor = 1.0
+    
+    if player["position"] in ["C", "L", "R", "F"]: pos_factor = MODEL_WEIGHTS["forward_boost"]
+    else: pos_factor = MODEL_WEIGHTS["defense_penalty"]
+    
+    if player["floor"] >= 2: floor_factor = MODEL_WEIGHTS["high_floor_2_boost"]
+    elif player["floor"] >= 1: floor_factor = MODEL_WEIGHTS["high_floor_1_boost"]
+    else: floor_factor = 1.0
+    
+    b2b_factor = MODEL_WEIGHTS["b2b_penalty"] if player.get("is_b2b") else 1.0
+    
+    adj_lambda = base_lambda * hr_factor * pp_factor * ha_factor * opp_factor * streak_factor * pos_factor * floor_factor * b2b_factor
+    
+    return poisson_prob_at_least(adj_lambda, threshold)
+
+# ============================================================================
+# NHL API FUNCTIONS
+# ============================================================================
+@st.cache_data(ttl=300)
 def get_todays_schedule(date_str: str) -> List[Dict]:
-    """Get schedule with back-to-back detection."""
     url = f"{NHL_WEB_API}/schedule/{date_str}"
     try:
         resp = requests.get(url, timeout=15)
@@ -192,11 +306,11 @@ def get_todays_schedule(date_str: str) -> List[Dict]:
         for game_week in data.get("gameWeek", []):
             if game_week.get("date") == date_str:
                 for game in game_week.get("games", []):
-                    away_team = game.get("awayTeam", {}).get("abbrev", "")
-                    home_team = game.get("homeTeam", {}).get("abbrev", "")
+                    away = game.get("awayTeam", {}).get("abbrev", "")
+                    home = game.get("homeTeam", {}).get("abbrev", "")
                     game_id = str(game.get("id", ""))
                     
-                    if not away_team or not home_team:
+                    if not away or not home:
                         continue
                     
                     try:
@@ -209,42 +323,38 @@ def get_todays_schedule(date_str: str) -> List[Dict]:
                     games.append({
                         "id": game_id,
                         "time": time_str,
-                        "away_team": away_team,
-                        "home_team": home_team,
-                        "matchup": f"{away_team} @ {home_team}"
+                        "away_team": away,
+                        "home_team": home,
+                        "matchup": f"{away} @ {home}"
                     })
         return games
     except:
         return []
 
-@st.cache_data(ttl=CACHE_TTL_DEFENSE)
+@st.cache_data(ttl=1800)
 def get_all_teams() -> List[Dict]:
     url = f"{NHL_WEB_API}/standings/now"
     try:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
-        data = resp.json()
         return [{"abbrev": t.get("teamAbbrev", {}).get("default", ""),
                  "name": t.get("teamName", {}).get("default", "")} 
-                for t in data.get("standings", [])]
+                for t in resp.json().get("standings", [])]
     except:
         return []
 
 def fetch_team_defense(team_abbrev: str) -> Dict:
-    """Fetch defense stats for a single team (for parallel execution)."""
     try:
         url = f"{NHL_WEB_API}/club-schedule-season/{team_abbrev}/{SEASON}"
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        data = resp.json()
         
-        completed = [g for g in data.get("games", []) 
+        completed = [g for g in resp.json().get("games", []) 
                     if g.get("gameType") == GAME_TYPE and g.get("gameState") == "OFF"]
         
         if not completed:
-            return {"team_abbrev": team_abbrev, "shots_allowed_per_game": 30.0, "shots_allowed_L5": 30.0, "grade": "C", "trend": "stable"}
+            return {"team_abbrev": team_abbrev, "shots_allowed_per_game": 30.0, "grade": "C", "trend": "stable"}
         
-        # Only fetch last 5 games (speed optimization)
         recent = completed[-DEFENSE_GAMES:]
         sa_list = []
         
@@ -252,7 +362,6 @@ def fetch_team_defense(team_abbrev: str) -> Dict:
             try:
                 box_url = f"{NHL_WEB_API}/gamecenter/{game['id']}/boxscore"
                 box_resp = requests.get(box_url, timeout=8)
-                box_resp.raise_for_status()
                 box_data = box_resp.json()
                 
                 home_abbrev = box_data.get("homeTeam", {}).get("abbrev", "")
@@ -275,97 +384,57 @@ def fetch_team_defense(team_abbrev: str) -> Dict:
         
         if sa_list:
             sa_pg = statistics.mean(sa_list)
-            # Detect trending (first half vs second half of sample)
             if len(sa_list) >= 4:
                 first_half = statistics.mean(sa_list[len(sa_list)//2:])
                 second_half = statistics.mean(sa_list[:len(sa_list)//2])
-                if second_half > first_half + 2:
-                    trend = "loosening"
-                elif second_half < first_half - 2:
-                    trend = "tightening"
-                else:
-                    trend = "stable"
+                if second_half > first_half + 2: trend = "loosening"
+                elif second_half < first_half - 2: trend = "tightening"
+                else: trend = "stable"
             else:
                 trend = "stable"
         else:
-            sa_pg = 30.0
-            trend = "stable"
+            sa_pg, trend = 30.0, "stable"
         
-        return {
-            "team_abbrev": team_abbrev,
-            "shots_allowed_per_game": round(sa_pg, 2),
-            "shots_allowed_L5": round(sa_pg, 2),
-            "grade": get_grade(sa_pg),
-            "trend": trend
-        }
+        return {"team_abbrev": team_abbrev, "shots_allowed_per_game": round(sa_pg, 2), "grade": get_grade(sa_pg), "trend": trend}
     except:
-        return {"team_abbrev": team_abbrev, "shots_allowed_per_game": 30.0, "shots_allowed_L5": 30.0, "grade": "C", "trend": "stable"}
-
-def get_team_defense_safe(teams: List[str], status_text) -> Dict[str, Dict]:
-    """Fetch defense stats - sequential but reliable."""
-    team_defense = {}
-    total = len(teams)
-    
-    for i, team in enumerate(teams):
-        status_text.text(f"🛡️ Defense: {team} ({i+1}/{total})")
-        try:
-            result = fetch_team_defense(team)
-            team_defense[team] = result
-        except Exception as e:
-            team_defense[team] = {"team_abbrev": team, "shots_allowed_per_game": 30.0, "shots_allowed_L5": 30.0, "grade": "C", "trend": "stable"}
-    
-    return team_defense
+        return {"team_abbrev": team_abbrev, "shots_allowed_per_game": 30.0, "grade": "C", "trend": "stable"}
 
 def fetch_roster(team_abbrev: str) -> List[Dict]:
-    """Fetch roster for a single team."""
     url = f"{NHL_WEB_API}/roster/{team_abbrev}/current"
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        data = resp.json()
         players = []
-        for category in ["forwards", "defensemen"]:
-            for player in data.get(category, []):
-                first = player.get('firstName', {}).get('default', '')
-                last = player.get('lastName', {}).get('default', '')
-                if first and last and player.get("id"):
-                    players.append({
-                        "id": player.get("id"),
-                        "name": f"{first} {last}",
-                        "position": player.get("positionCode", ""),
-                        "team": team_abbrev
-                    })
+        for cat in ["forwards", "defensemen"]:
+            for p in resp.json().get(cat, []):
+                first = p.get('firstName', {}).get('default', '')
+                last = p.get('lastName', {}).get('default', '')
+                if first and last and p.get("id"):
+                    players.append({"id": p["id"], "name": f"{first} {last}", "position": p.get("positionCode", ""), "team": team_abbrev})
         return players
     except:
         return []
 
 def fetch_player_full(player_info: Dict) -> Optional[Dict]:
-    """Fetch player stats + advanced stats in optimized way."""
     player_id = player_info["id"]
     name = player_info["name"]
     team = player_info["team"]
     position = player_info["position"]
     
-    # Get game log
     url = f"{NHL_WEB_API}/player/{player_id}/game-log/{SEASON}/{GAME_TYPE}"
     try:
         resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
         games = resp.json().get("gameLog", [])
         
         if len(games) < MIN_GAMES:
             return None
         
-        all_shots = []
-        home_shots = []
-        away_shots = []
-        game_dates = []
+        all_shots, home_shots, away_shots, game_dates = [], [], [], []
         
         for game in games:
             shots = max(0, game.get("shots", 0))
             all_shots.append(shots)
             game_dates.append(game.get("gameDate", ""))
-            
             if game.get("homeRoadFlag", "") == "H":
                 home_shots.append(shots)
             else:
@@ -390,52 +459,40 @@ def fetch_player_full(player_info: Dict) -> Optional[Dict]:
         
         streak = 0
         for s in all_shots:
-            if s >= 2:
-                streak += 1
-            else:
-                break
+            if s >= 2: streak += 1
+            else: break
         
         home_avg = sum(home_shots) / len(home_shots) if home_shots else avg
         away_avg = sum(away_shots) / len(away_shots) if away_shots else avg
         
-        # Get PP time from landing page (combined call)
         pp_toi = 0
         try:
             landing_url = f"{NHL_WEB_API}/player/{player_id}/landing"
             landing_resp = requests.get(landing_url, timeout=8)
-            landing_resp.raise_for_status()
-            landing_data = landing_resp.json()
-            
-            for season in landing_data.get("seasonTotals", []):
+            for season in landing_resp.json().get("seasonTotals", []):
                 if str(season.get("season")) == SEASON and season.get("gameTypeId") == GAME_TYPE:
                     pp_toi_str = season.get("powerPlayToi", "00:00")
                     season_gp = season.get("gamesPlayed", 1)
                     try:
                         parts = pp_toi_str.split(":")
-                        total_mins = int(parts[0]) + int(parts[1]) / 60
-                        pp_toi = total_mins / season_gp if season_gp > 0 else 0
+                        pp_toi = (int(parts[0]) + int(parts[1]) / 60) / season_gp if season_gp > 0 else 0
                     except:
                         pass
                     break
         except:
             pass
         
-        # Detect back-to-back (if last game was yesterday)
         is_b2b = False
         if len(game_dates) >= 1 and game_dates[0]:
             try:
                 last_game = datetime.strptime(game_dates[0], "%Y-%m-%d")
-                today = datetime.now()
-                if (today - last_game).days == 1:
+                if (datetime.now() - last_game).days == 1:
                     is_b2b = True
             except:
                 pass
         
         return {
-            "player_id": player_id,
-            "name": name,
-            "team": team,
-            "position": position,
+            "player_id": player_id, "name": name, "team": team, "position": position,
             "games_played": gp,
             "hit_rate_2plus": round(hit_2, 1),
             "hit_rate_3plus": round(hit_3, 1),
@@ -457,92 +514,6 @@ def fetch_player_full(player_info: Dict) -> Optional[Dict]:
         return None
 
 # ============================================================================
-# IMPROVED PROBABILITY MODEL
-# ============================================================================
-def calculate_model_probability(player: Dict, opp_def: Dict, is_home: bool, threshold: int) -> float:
-    """Enhanced probability model with more factors."""
-    
-    # Base lambda (weighted average)
-    base_lambda = (
-        player["last_5_avg"] * MODEL_WEIGHTS["l5_weight"] +
-        player["last_10_avg"] * MODEL_WEIGHTS["l10_weight"] +
-        player["avg_sog"] * MODEL_WEIGHTS["season_weight"]
-    )
-    
-    # Hit rate boost (tiered)
-    hit_rate = player[f"hit_rate_{threshold}plus"]
-    if hit_rate >= 95:
-        hr_factor = MODEL_WEIGHTS["hit_rate_95_boost"]
-    elif hit_rate >= 90:
-        hr_factor = MODEL_WEIGHTS["hit_rate_90_boost"]
-    elif hit_rate >= 85:
-        hr_factor = MODEL_WEIGHTS["hit_rate_85_boost"]
-    elif hit_rate >= 80:
-        hr_factor = MODEL_WEIGHTS["hit_rate_80_boost"]
-    else:
-        hr_factor = 1.0
-    
-    # Power play factor
-    if player["is_pp1"]:
-        pp_factor = MODEL_WEIGHTS["pp1_boost"]
-    elif player["pp_toi"] > 1.0:
-        pp_factor = MODEL_WEIGHTS["pp2_boost"]
-    else:
-        pp_factor = 1.0
-    
-    # Home/away
-    ha_factor = MODEL_WEIGHTS["home_boost"] if is_home else MODEL_WEIGHTS["away_penalty"]
-    
-    # Opponent base factor
-    opp_sa = opp_def.get("shots_allowed_per_game", 30.0)
-    opp_factor = opp_sa / 30.0
-    
-    # NEW: Opponent trending adjustment
-    opp_trend = opp_def.get("trend", "stable")
-    if opp_trend == "loosening":
-        opp_factor *= MODEL_WEIGHTS["opp_loosening_boost"]
-    elif opp_trend == "tightening":
-        opp_factor *= MODEL_WEIGHTS["opp_tightening_penalty"]
-    
-    # Hot/cold streak
-    trend, is_hot, is_cold = get_trend(player["last_5_avg"], player["avg_sog"])
-    if is_hot:
-        streak_factor = MODEL_WEIGHTS["hot_streak_boost"]
-    elif is_cold:
-        streak_factor = MODEL_WEIGHTS["cold_streak_penalty"]
-    else:
-        streak_factor = 1.0
-    
-    # NEW: Position factor
-    if player["position"] in ["C", "L", "R", "F"]:
-        pos_factor = MODEL_WEIGHTS["forward_boost"]
-    else:
-        pos_factor = MODEL_WEIGHTS["defense_penalty"]
-    
-    # NEW: Floor reliability bonus (only for rare high-floor players)
-    if player["floor"] >= 2:
-        floor_factor = MODEL_WEIGHTS["high_floor_2_boost"]
-    elif player["floor"] >= 1:
-        floor_factor = MODEL_WEIGHTS["high_floor_1_boost"]
-    else:
-        floor_factor = 1.0  # No penalty - 0 floor is normal
-    
-    # NEW: Back-to-back penalty
-    if player.get("is_b2b", False):
-        b2b_factor = MODEL_WEIGHTS["b2b_penalty"]
-    else:
-        b2b_factor = 1.0
-    
-    # Calculate adjusted lambda
-    adj_lambda = (base_lambda * hr_factor * pp_factor * ha_factor * 
-                  opp_factor * streak_factor * pos_factor * floor_factor * b2b_factor)
-    
-    # Poisson probability
-    prob = poisson_prob_at_least(adj_lambda, threshold)
-    
-    return prob
-
-# ============================================================================
 # PARLAY GENERATION
 # ============================================================================
 def generate_best_parlay(plays: List[Dict], num_legs: int, threshold: int) -> Optional[Dict]:
@@ -556,8 +527,7 @@ def generate_best_parlay(plays: List[Dict], num_legs: int, threshold: int) -> Op
     combined_prob, american_odds = calculate_parlay_odds(probs)
     
     return {
-        "legs": best_legs,
-        "num_legs": num_legs,
+        "legs": best_legs, "num_legs": num_legs,
         "combined_prob": combined_prob,
         "american_odds": american_odds,
         "payout_per_100": calculate_parlay_payout(american_odds, 100)
@@ -565,7 +535,6 @@ def generate_best_parlay(plays: List[Dict], num_legs: int, threshold: int) -> Op
 
 def generate_sgp_for_game(plays: List[Dict], game_id: str, threshold: int, min_legs: int = 3, min_odds: int = 300) -> Optional[Dict]:
     game_plays = [p for p in plays if p["game_id"] == game_id]
-    
     if len(game_plays) < min_legs:
         return None
     
@@ -580,7 +549,6 @@ def generate_sgp_for_game(plays: List[Dict], game_id: str, threshold: int, min_l
         if american_odds >= min_odds:
             qualified_count = sum(1 for p in legs if p["is_qualified"])
             risky_count = num_legs - qualified_count
-            
             return {
                 "legs": legs, "num_legs": num_legs, "combined_prob": combined_prob,
                 "american_odds": american_odds, "payout_per_100": calculate_parlay_payout(american_odds, 100),
@@ -588,7 +556,6 @@ def generate_sgp_for_game(plays: List[Dict], game_id: str, threshold: int, min_l
                 "risk_level": "🟢" if risky_count == 0 else ("🟡" if risky_count <= 1 else "🔴")
             }
     
-    # Return best available if can't hit +300
     if len(sorted_plays) >= min_legs:
         legs = sorted_plays[:min_legs]
         probs = [p[prob_key] / 100 for p in legs]
@@ -600,24 +567,22 @@ def generate_sgp_for_game(plays: List[Dict], game_id: str, threshold: int, min_l
             "game_id": game_id, "qualified_count": qualified_count, "risky_count": min_legs - qualified_count,
             "risk_level": "⚪"
         }
-    
     return None
 
 # ============================================================================
 # UI COMPONENTS
 # ============================================================================
 def show_model_explanation():
-    with st.expander("📖 Model v3.4.1 - How It Works", expanded=False):
+    with st.expander("📖 Model v3.5 - How It Works", expanded=False):
         col1, col2 = st.columns(2)
-        
         with col1:
             st.markdown("""
             ### Base Calculation
             **Lambda** = L5 (45%) + L10 (30%) + Avg (25%)
             
-            ### Multipliers
-            | Factor | Boost |
-            |--------|-------|
+            ### Boosts
+            | Factor | Multiplier |
+            |--------|------------|
             | Hit Rate 95%+ | ×1.15 |
             | Hit Rate 90%+ | ×1.12 |
             | Hit Rate 85%+ | ×1.08 |
@@ -626,28 +591,22 @@ def show_model_explanation():
             | 🔥 Hot | ×1.06 |
             | Forward | ×1.02 |
             | Floor ≥2 | ×1.06 |
-            | Floor ≥1 | ×1.04 |
             """)
-        
         with col2:
             st.markdown("""
             ### Penalties
-            | Factor | Penalty |
-            |--------|---------|
+            | Factor | Multiplier |
+            |--------|------------|
             | ❄️ Cold | ×0.90 |
             | Away | ×0.97 |
             | Defenseman | ×0.96 |
             | Back-to-Back | ×0.94 |
             | Opp Tightening | ×0.96 |
             
-            ### Bonuses (Rare)
-            | Factor | Boost |
-            |--------|-------|
-            | Floor ≥2 | ×1.06 |
-            | Floor ≥1 | ×1.04 |
+            ### Edge Calculation
+            **Edge** = Model% - Vegas%
             
-            ### Opponent Factor
-            = SA/G ÷ 30 (adjusted for trend)
+            Positive = We think it hits more than Vegas
             """)
 
 # ============================================================================
@@ -655,7 +614,7 @@ def show_model_explanation():
 # ============================================================================
 def main():
     st.title("🏒 NHL SOG Analyzer")
-    st.caption("v3.4.1 | Improved Model")
+    st.caption("v3.5 | Real Odds + Edge Calculator")
     
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -675,6 +634,15 @@ def main():
         
         st.markdown("---")
         
+        st.subheader("📊 Odds API")
+        api_key = st.text_input("The Odds API Key", type="password", help="Get free key at the-odds-api.com")
+        
+        if not api_key:
+            st.caption("⚠️ No API key = no real odds")
+            st.caption("[Get free key](https://the-odds-api.com)")
+        
+        st.markdown("---")
+        
         run_analysis = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
         
         st.markdown("---")
@@ -691,7 +659,7 @@ def main():
     
     with tab1:
         if run_analysis:
-            plays, games = run_optimized_analysis(date_str, threshold)
+            plays, games = run_analysis_with_odds(date_str, threshold, api_key)
             st.session_state.all_plays = plays
             st.session_state.games = games
             st.session_state.threshold = threshold
@@ -701,9 +669,9 @@ def main():
             st.info("👈 Click **Run Analysis**")
             games = get_todays_schedule(date_str)
             if games:
-                st.subheader(f"📅 {date_str}")
-                for game in games:
-                    st.write(f"**{game['away_team']}** @ **{game['home_team']}** - {game['time']}")
+                st.subheader(f"📅 {len(games)} Games Today")
+                game_df = pd.DataFrame([{"Away": g["away_team"], "Home": g["home_team"], "Time": g["time"]} for g in games])
+                st.dataframe(game_df, use_container_width=True, hide_index=True)
     
     with tab2:
         if st.session_state.all_plays:
@@ -720,16 +688,16 @@ def main():
     with tab4:
         show_help()
 
-def run_optimized_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], List[Dict]]:
-    """Analysis with progress tracking."""
+def run_analysis_with_odds(date_str: str, threshold: int, api_key: str) -> Tuple[List[Dict], List[Dict]]:
+    """Run analysis and merge with real sportsbook odds."""
     
-    st.subheader(f"📅 {date_str}")
     games = get_todays_schedule(date_str)
     
     if not games:
         st.error("No games found!")
         return [], []
     
+    st.subheader(f"📅 {len(games)} Games Today")
     game_df = pd.DataFrame([{"Away": g["away_team"], "Home": g["home_team"], "Time": g["time"]} for g in games])
     st.dataframe(game_df, use_container_width=True, hide_index=True)
     
@@ -749,22 +717,33 @@ def run_optimized_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], L
     
     start_time = time.time()
     
-    # Fetch defense stats (sequential but reliable)
-    status_text.text(f"🛡️ Fetching defense for {len(teams_playing)} teams...")
-    team_defense = get_team_defense_safe(list(teams_playing), status_text)
-    progress_bar.progress(15)
+    # Fetch sportsbook odds first
+    sportsbook_odds = {}
+    if api_key:
+        status_text.text("📊 Fetching sportsbook odds...")
+        sportsbook_odds = fetch_all_odds(api_key, status_text)
+        if sportsbook_odds:
+            stats_display.text(f"Found odds for {len(sportsbook_odds)} players")
+    progress_bar.progress(10)
     
-    # Fetch rosters (sequential)
+    # Fetch defense
+    status_text.text(f"🛡️ Fetching defense for {len(teams_playing)} teams...")
+    team_defense = {}
+    for i, team in enumerate(teams_playing):
+        status_text.text(f"🛡️ Defense: {team}")
+        team_defense[team] = fetch_team_defense(team)
+    progress_bar.progress(20)
+    
+    # Fetch rosters
     status_text.text("📋 Fetching rosters...")
     all_players = []
     for team in teams_playing:
-        roster = fetch_roster(team)
-        all_players.extend(roster)
+        all_players.extend(fetch_roster(team))
     progress_bar.progress(25)
     
-    stats_display.text(f"Found {len(all_players)} players to analyze")
+    stats_display.text(f"Analyzing {len(all_players)} players...")
     
-    # Analyze players (sequential with progress)
+    # Analyze players
     all_plays = []
     total = len(all_players)
     
@@ -775,7 +754,6 @@ def run_optimized_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], L
         
         try:
             stats = fetch_player_full(player_info)
-            
             if not stats:
                 continue
             
@@ -798,6 +776,32 @@ def run_optimized_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], L
             trend, is_hot, is_cold = get_trend(stats["last_5_avg"], stats["avg_sog"])
             is_qualified, status_icon = get_status_icon(hit_rate, is_cold)
             
+            # Match with sportsbook odds
+            normalized_name = normalize_name(stats["name"])
+            odds_data = sportsbook_odds.get(normalized_name, {})
+            
+            # Get the right line based on threshold
+            vegas_odds = None
+            vegas_line = None
+            vegas_implied = None
+            vegas_book = None
+            
+            if odds_data:
+                odds_line = odds_data.get("line", 0)
+                # Check if line matches our threshold (1.5, 2.5, 3.5)
+                target_line = threshold - 0.5
+                if abs(odds_line - target_line) < 0.1:  # Line matches
+                    vegas_odds = odds_data.get("odds")
+                    vegas_line = odds_line
+                    vegas_implied = american_to_implied_prob(vegas_odds) * 100 if vegas_odds else None
+                    vegas_book = odds_data.get("book", "")
+            
+            # Calculate edge
+            model_prob = prob_2 if threshold == 2 else prob_3 if threshold == 3 else prob_4
+            edge = None
+            if vegas_implied:
+                edge = (model_prob * 100) - vegas_implied
+            
             play = {
                 "player": stats,
                 "opponent": opp,
@@ -814,7 +818,13 @@ def run_optimized_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], L
                 "trend": trend,
                 "is_hot": is_hot,
                 "is_cold": is_cold,
-                "tags": get_tags(stats)
+                "tags": get_tags(stats),
+                # Odds data
+                "vegas_odds": vegas_odds,
+                "vegas_line": vegas_line,
+                "vegas_implied": vegas_implied,
+                "vegas_book": vegas_book,
+                "edge": edge,
             }
             all_plays.append(play)
             stats_display.text(f"Checked: {i+1}/{total} | Found: {len(all_plays)}")
@@ -823,26 +833,29 @@ def run_optimized_analysis(date_str: str, threshold: int) -> Tuple[List[Dict], L
             continue
     
     progress_bar.progress(100)
-    elapsed_total = time.time() - start_time
-    status_text.text(f"✅ Complete in {elapsed_total:.1f}s!")
+    elapsed = time.time() - start_time
+    status_text.text(f"✅ Complete in {elapsed:.1f}s!")
     
     time.sleep(1)
     progress_bar.empty()
     status_text.empty()
     stats_display.empty()
     
-    # Sort by probability
+    # Sort by model probability
     prob_key = f"prob_{threshold}plus"
     all_plays.sort(key=lambda x: x[prob_key], reverse=True)
     
-    st.success(f"Found **{len(all_plays)}** players in **{elapsed_total:.1f}s**")
+    # Count players with odds
+    with_odds = len([p for p in all_plays if p["vegas_odds"]])
+    st.success(f"Found **{len(all_plays)}** players | **{with_odds}** with odds | **{elapsed:.1f}s**")
+    
     display_all_results(all_plays, threshold, date_str)
     
     return all_plays, games
 
 def display_all_results(plays: List[Dict], threshold: int, date_str: str):
     st.subheader(f"🎯 All Players - O{threshold - 0.5} SOG")
-    st.caption("Sorted by Model Probability")
+    st.caption("Sorted by Model Probability | Green edge = value bet")
     
     show_model_explanation()
     
@@ -850,35 +863,73 @@ def display_all_results(plays: List[Dict], threshold: int, date_str: str):
     prob_key = f"prob_{threshold}plus"
     
     qualified = len([p for p in plays if p["is_qualified"]])
+    with_edge = len([p for p in plays if p.get("edge") and p["edge"] > 0])
     pp1_count = len([p for p in plays if p["player"]["is_pp1"]])
-    hot_count = len([p for p in plays if p["is_hot"]])
     
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total", len(plays))
     col2.metric("✅ Qualified", qualified)
-    col3.metric("⚡ PP1", pp1_count)
-    col4.metric("🔥 Hot", hot_count)
+    col3.metric("📈 +Edge", with_edge)
+    col4.metric("⚡ PP1", pp1_count)
     
+    # Build results with edge column
     results_data = []
     for play in plays:
         p = play["player"]
+        
+        # Format edge
+        edge_str = ""
+        if play.get("edge") is not None:
+            edge_val = play["edge"]
+            if edge_val > 0:
+                edge_str = f"+{edge_val:.1f}%"
+            else:
+                edge_str = f"{edge_val:.1f}%"
+        
+        # Format vegas
+        vegas_str = ""
+        if play.get("vegas_odds"):
+            vegas_str = f"{play['vegas_odds']:+d}"
+        
+        vegas_impl_str = ""
+        if play.get("vegas_implied"):
+            vegas_impl_str = f"{play['vegas_implied']:.0f}%"
+        
         row = {
             "": play["status_icon"],
             "Player": p["name"],
             "Tags": play["tags"],
             "Team": p["team"],
             "vs": play["opponent"],
-            "Prob%": play[prob_key],
+            "Model%": play[prob_key],
+            "Vegas%": vegas_impl_str,
+            "Edge": edge_str,
+            "Odds": vegas_str,
             "Hit%": p[hit_key],
             "Avg": p["avg_sog"],
             "L5": p["last_5_avg"],
-            "Floor": p["floor"],
             "Trend": play["trend"],
-            "Def": play["opponent_defense"]["grade"],
         }
         results_data.append(row)
     
     df = pd.DataFrame(results_data)
+    
+    # Style edge column
+    def style_edge(val):
+        if not val or val == "":
+            return ""
+        try:
+            num = float(val.replace("%", "").replace("+", ""))
+            if num > 5:
+                return "color: #00ff00; font-weight: bold"
+            elif num > 0:
+                return "color: #90EE90"
+            elif num < -5:
+                return "color: #ff6b6b"
+            else:
+                return "color: #ffb347"
+        except:
+            return ""
     
     st.dataframe(
         df, 
@@ -886,7 +937,7 @@ def display_all_results(plays: List[Dict], threshold: int, date_str: str):
         hide_index=True,
         column_config={
             "": st.column_config.TextColumn("", width="small"),
-            "Prob%": st.column_config.ProgressColumn("Prob%", min_value=0, max_value=100, format="%.1f%%"),
+            "Model%": st.column_config.ProgressColumn("Model%", min_value=0, max_value=100, format="%.1f%%"),
             "Hit%": st.column_config.NumberColumn("Hit%", format="%.1f%%"),
         }
     )
@@ -897,17 +948,42 @@ def show_best_bets(plays: List[Dict], threshold: int):
     st.header("🎯 Best Bets")
     show_model_explanation()
     
+    # Split into value bets vs all qualified
+    value_bets = [p for p in plays if p.get("edge") and p["edge"] > 3 and p["is_qualified"]]
     qualified = [p for p in plays if p["is_qualified"]]
     risky = [p for p in plays if not p["is_qualified"]]
     
     hit_key = f"hit_rate_{threshold}plus"
     prob_key = f"prob_{threshold}plus"
     
+    # Value bets section
+    if value_bets:
+        st.subheader(f"💰 Value Bets ({len(value_bets)})")
+        st.caption("Qualified + Edge > 3%")
+        
+        value_data = []
+        for play in sorted(value_bets, key=lambda x: x["edge"], reverse=True):
+            p = play["player"]
+            value_data.append({
+                "Player": p["name"],
+                "Tags": play["tags"],
+                "Team": p["team"],
+                "vs": play["opponent"],
+                "Model%": f"{play[prob_key]:.1f}%",
+                "Vegas%": f"{play['vegas_implied']:.0f}%" if play.get("vegas_implied") else "",
+                "Edge": f"+{play['edge']:.1f}%",
+                "Odds": f"{play['vegas_odds']:+d}" if play.get("vegas_odds") else "",
+            })
+        st.dataframe(pd.DataFrame(value_data), use_container_width=True, hide_index=True)
+        st.markdown("---")
+    
     st.subheader(f"✅ Qualified ({len(qualified)})")
     if qualified:
         qual_data = [{"Player": p["player"]["name"], "Tags": p["tags"], "Team": p["player"]["team"], 
-                      "vs": p["opponent"], "Prob%": p[prob_key], "Hit%": p["player"][hit_key], 
-                      "L5": p["player"]["last_5_avg"], "Trend": p["trend"]} for p in qualified]
+                      "vs": p["opponent"], "Model%": f"{p[prob_key]:.1f}%",
+                      "Vegas%": f"{p['vegas_implied']:.0f}%" if p.get("vegas_implied") else "",
+                      "Edge": f"{p['edge']:+.1f}%" if p.get("edge") else "",
+                      "Trend": p["trend"]} for p in qualified]
         st.dataframe(pd.DataFrame(qual_data), use_container_width=True, hide_index=True)
     else:
         st.warning("No qualified plays")
@@ -916,8 +992,9 @@ def show_best_bets(plays: List[Dict], threshold: int):
     st.subheader(f"⚠️ Higher Risk ({len(risky)})")
     if risky:
         risk_data = [{"Player": p["player"]["name"], "Tags": p["tags"], "Team": p["player"]["team"],
-                      "vs": p["opponent"], "Prob%": p[prob_key], "Hit%": p["player"][hit_key],
-                      "L5": p["player"]["last_5_avg"], "Trend": p["trend"]} for p in risky]
+                      "vs": p["opponent"], "Model%": f"{p[prob_key]:.1f}%",
+                      "Vegas%": f"{p['vegas_implied']:.0f}%" if p.get("vegas_implied") else "",
+                      "Trend": p["trend"]} for p in risky]
         st.dataframe(pd.DataFrame(risk_data), use_container_width=True, hide_index=True)
 
 def show_parlays(plays: List[Dict], games: List[Dict], threshold: int, unit_size: float):
@@ -925,7 +1002,6 @@ def show_parlays(plays: List[Dict], games: List[Dict], threshold: int, unit_size
     show_model_explanation()
     
     prob_key = f"prob_{threshold}plus"
-    hit_key = f"hit_rate_{threshold}plus"
     sorted_plays = sorted(plays, key=lambda x: x[prob_key], reverse=True)
     
     st.success(f"Building from **{len(sorted_plays)}** players")
@@ -970,7 +1046,7 @@ def show_parlays(plays: List[Dict], games: List[Dict], threshold: int, unit_size
         col2.metric("Prob", f"{ultimate['combined_prob']*100:.2f}%")
         col3.metric("Odds", f"{ultimate['american_odds']:+d}" if ultimate['american_odds'] < 100000 else "Long shot")
         with st.expander("📋 View & Copy"):
-            st.dataframe(pd.DataFrame([{"Player": p["player"]["name"], "Prob%": f"{p[prob_key]:.0f}%"} for p in ultimate["legs"]]), hide_index=True)
+            st.dataframe(pd.DataFrame([{"Player": p["player"]["name"], "Model%": f"{p[prob_key]:.0f}%"} for p in ultimate["legs"]]), hide_index=True)
             st.code(format_parlay_text(ultimate["legs"], threshold, f"Ultimate {ultimate['num_legs']}-Leg", ultimate['combined_prob'], ultimate['american_odds']), language=None)
     
     st.markdown("---")
@@ -984,7 +1060,7 @@ def show_parlays(plays: List[Dict], games: List[Dict], threshold: int, unit_size
                 col2.metric("Prob", f"{sgp['combined_prob']*100:.1f}%")
                 col3.metric("Odds", f"{sgp['american_odds']:+d}")
                 col4.metric(f"${unit_size:.0f}→", f"${sgp['payout_per_100'] * unit_size / 100:.0f}")
-                st.dataframe(pd.DataFrame([{"": "✅" if p["is_qualified"] else "⚠️", "Player": p["player"]["name"], "Prob%": f"{p[prob_key]:.0f}%"} for p in sgp["legs"]]), hide_index=True)
+                st.dataframe(pd.DataFrame([{"": "✅" if p["is_qualified"] else "⚠️", "Player": p["player"]["name"], "Model%": f"{p[prob_key]:.0f}%"} for p in sgp["legs"]]), hide_index=True)
                 copy_text = f"🎮 SGP - {game['matchup']}\n" + "─"*30 + "\n"
                 for p in sgp["legs"]:
                     copy_text += f"{'✅' if p['is_qualified'] else '⚠️'} {p['player']['name']} O{threshold-0.5} SOG\n"
@@ -995,19 +1071,37 @@ def show_help():
     st.header("❓ Help")
     show_model_explanation()
     st.markdown("""
-    ## v3.4.1 Improvements
+    ## v3.5 Features
     
-    ### ⚡ Speed
-    - **Reduced defense fetching** - 5 games instead of 10
-    - **Smarter caching** - 30 min for defense stats
-    - **Progress tracking** - See exactly what's happening
+    ### 📊 Real Odds Integration
+    - Add your **The Odds API** key in sidebar
+    - Shows actual sportsbook odds (Hard Rock, DK, FD, etc.)
+    - Free tier: 500 requests/month
+    - Get key at [the-odds-api.com](https://the-odds-api.com)
     
-    ### 🧮 Model
-    - **Position factor** - Forwards shoot more than D
-    - **Back-to-back detection** - Fatigue penalty
-    - **Opponent trending** - Is defense getting worse/better?
-    - **Floor bonus** - Floor ≥1 or ≥2 gets boost (rare but valuable)
-    - **More aggressive cold penalty** - Cold streaks hurt more
+    ### 📈 Edge Calculator
+    - **Model%** = Our probability prediction
+    - **Vegas%** = Implied probability from sportsbook odds
+    - **Edge** = Model% - Vegas%
+    
+    | Edge | Meaning |
+    |------|---------|
+    | +5%+ | Strong value |
+    | +1-5% | Slight edge |
+    | 0% | Fair line |
+    | Negative | Overpriced |
+    
+    ### 💰 Value Bets
+    Best Bets tab shows **Value Bets** section:
+    - Qualified players (85%+, not cold)
+    - Edge > 3%
+    - Sorted by edge
+    
+    ### Without API Key
+    Works fine without odds - just won't show:
+    - Vegas% column
+    - Edge column
+    - Value Bets section
     """)
 
 if __name__ == "__main__":
