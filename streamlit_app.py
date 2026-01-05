@@ -1201,7 +1201,7 @@ def display_all_results(plays: List[Dict], threshold: int):
     col4.metric("⚠️ Risky", risky)
     col5.metric("Total", len(plays))
     
-    # Build table data
+    # Build table data - compact view (Tier, Team, Loc, vs in Tiered Breakdown)
     rows = []
     for p in plays:
         player = p["player"]
@@ -1219,12 +1219,8 @@ def display_all_results(plays: List[Dict], threshold: int):
         
         row = {
             "Score": f"{get_score_color(p['parlay_score'])} {p['parlay_score']:.0f}",
-            "Tier": p["tier"],
             "Player": player["name"],
             "Tags": p["tags"],
-            "Team": player["team"],
-            "vs": f"{p['opponent']} ({p['opponent_defense'].get('grade', 'C')})",
-            "Loc": "Home" if p["home_away"] == "HOME" else "Away",
             "Hit%": f"{hit_rate:.0f}%",
             "Cush%": f"{cushion:.0f}%",
             "Shut%": f"{player.get('shutout_rate', 0):.0f}%",
@@ -1239,7 +1235,7 @@ def display_all_results(plays: List[Dict], threshold: int):
     
     df = pd.DataFrame(rows)
     
-    # Display with column config - compact widths
+    # Display with column config - Player auto-fits to content
     st.dataframe(
         df, 
         use_container_width=True, 
@@ -1247,12 +1243,8 @@ def display_all_results(plays: List[Dict], threshold: int):
         height=500,
         column_config={
             "Score": st.column_config.TextColumn("Score", width="small"),
-            "Tier": st.column_config.TextColumn("Tier", width="small"),
-            "Player": st.column_config.TextColumn("Player", width="small"),
+            "Player": st.column_config.TextColumn("Player", width="medium"),
             "Tags": st.column_config.TextColumn("Tags", width="small"),
-            "Team": st.column_config.TextColumn("Team", width="small"),
-            "vs": st.column_config.TextColumn("vs", width="small"),
-            "Loc": st.column_config.TextColumn("Loc", width="small"),
             "Hit%": st.column_config.TextColumn("Hit%", width="small"),
             "Cush%": st.column_config.TextColumn("Cush%", width="small"),
             "Shut%": st.column_config.TextColumn("Shut%", width="small"),
@@ -1271,9 +1263,37 @@ def display_all_results(plays: List[Dict], threshold: int):
         }
     )
     
-    # Download
-    csv_df = df.copy()
-    csv_df["Prob"] = csv_df["Prob"].round(0).astype(int).astype(str) + "%"
+    # Download CSV with full details (includes Tier, Team, vs, Loc)
+    csv_rows = []
+    for p in plays:
+        player = p["player"]
+        hit_rate = player.get(f"hit_rate_{threshold}plus", 0)
+        cushion = player.get(f"cushion_{threshold}", 0)
+        toi_str = f"{player.get('avg_toi', 0):.0f}m"
+        if player.get("avg_toi", 0) > 0:
+            pct = (player.get("l5_toi", 0) - player["avg_toi"]) / player["avg_toi"] * 100
+            if abs(pct) >= 10:
+                toi_str += f" ({pct:+.0f}%)"
+        
+        csv_rows.append({
+            "Score": f"{get_score_color(p['parlay_score'])} {p['parlay_score']:.0f}",
+            "Tier": p["tier"],
+            "Player": player["name"],
+            "Tags": p["tags"],
+            "Team": player["team"],
+            "vs": f"{p['opponent']} ({p['opponent_defense'].get('grade', 'C')})",
+            "Loc": "Home" if p["home_away"] == "HOME" else "Away",
+            "Hit%": f"{hit_rate:.0f}%",
+            "Cush%": f"{cushion:.0f}%",
+            "Shut%": f"{player.get('shutout_rate', 0):.0f}%",
+            "Avg": player["avg_sog"],
+            "L5": player["last_5_avg"],
+            "L10": player.get("last_10_avg", player["avg_sog"]),
+            "SOG/60": player.get("sog_per_60", 0),
+            "TOI": toi_str,
+            "Prob": f"{p['model_prob']:.0f}%",
+        })
+    csv_df = pd.DataFrame(csv_rows)
     csv = csv_df.to_csv(index=False)
     st.download_button("📥 Download CSV", csv, f"nhl_sog_v72_{get_est_date()}.csv", "text/csv")
 
