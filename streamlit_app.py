@@ -1421,70 +1421,8 @@ def fetch_results(check_date: str, threshold: int, status_container):
     if results_found > 0:
         st.session_state.results_history[check_date] = picks
         save_history(st.session_state.results_history)
-        
-        # Update parlay results if we have a saved parlay for this date
-        if check_date in st.session_state.parlay_history:
-            parlay = st.session_state.parlay_history[check_date]
-            # Skip non-dict values (e.g., "init" key from JSONBin)
-            if not isinstance(parlay, dict):
-                parlay = None
-            
-            if parlay and parlay.get("legs"):
-                parlay_threshold = parlay.get("threshold", 2)
-                
-                # Build comprehensive lookup from ALL results (picks + direct boxscore)
-                results_by_id = {}
-                results_by_name = {}
-                
-                # First, from our tracked picks
-                for pick in picks:
-                    if "actual_sog" in pick:
-                        pid = str(pick.get("player_id", ""))
-                        pname = pick.get("player", "").lower().strip()
-                        results_by_id[pid] = {"actual_sog": pick["actual_sog"]}
-                        if pname:
-                            results_by_name[pname] = {"actual_sog": pick["actual_sog"]}
-                
-                # Also add from all_player_results we collected during boxscore fetch
-                # This ensures parlay legs are found even if not in original picks
-                
-                # Check each parlay leg
-                legs_hit = 0
-                legs_checked = 0
-                for leg in parlay.get("legs", []):
-                    leg_pid = str(leg.get("player_id", ""))
-                    leg_name = leg.get("player_name", "").lower().strip()
-                    
-                    matched = None
-                    if leg_pid in results_by_id:
-                        matched = results_by_id[leg_pid]
-                    elif leg_name in results_by_name:
-                        matched = results_by_name[leg_name]
-                    
-                    if matched and "actual_sog" in matched:
-                        legs_checked += 1
-                        actual = matched["actual_sog"]
-                        leg["actual_sog"] = actual
-                        leg["hit"] = 1 if actual >= parlay_threshold else 0
-                        if leg["hit"]:
-                            legs_hit += 1
-                
-                # Update parlay result - even if not all legs checked
-                if legs_checked > 0:
-                    parlay["legs_hit"] = legs_hit
-                    parlay["legs_checked"] = legs_checked
-                    if legs_checked == len(parlay.get("legs", [])):
-                        parlay["result"] = "WIN" if legs_hit == len(parlay["legs"]) else "LOSS"
-                    else:
-                        parlay["result"] = f"PARTIAL ({legs_checked}/{len(parlay['legs'])} matched)"
-                    st.session_state.parlay_history[check_date] = parlay
-                    save_parlay_history(st.session_state.parlay_history, verify_date=check_date)
-    
-    # If parlay still has no result, try direct fetch
-    if check_date in st.session_state.parlay_history:
-        parlay = st.session_state.parlay_history[check_date]
-        if isinstance(parlay, dict) and parlay.get("result") is None:
-            fetch_parlay_results_direct(check_date, status_container)
+        # NOTE: Parlay updates are handled by fetch_parlay_results_direct()
+        # which is always called after fetch_results() from the Fetch button
     
     if games_finished == 0:
         status_container.warning("⏳ No finished games found")
@@ -2135,23 +2073,25 @@ def display_results_tracker(threshold: int):
             
             fetch_results(check_date_str, threshold, status)
             
-            # After fetch_results, check parlay state
+            # ALWAYS run fetch_parlay_results_direct to ensure leg actuals are properly set
+            # Don't rely on fetch_results() to update parlay - it may set result but not leg actuals
             if check_date_str in st.session_state.parlay_history:
                 parlay = st.session_state.parlay_history[check_date_str]
-                current_result = parlay.get("result") if isinstance(parlay, dict) else None
-                st.session_state.parlay_debug.append(f"📊 After fetch_results: result={current_result}")
-                
-                if current_result is None:
-                    status.info("🎰 Parlay still pending - running direct fetch...")
-                    st.session_state.parlay_debug.append("🎰 Calling fetch_parlay_results_direct...")
+                if isinstance(parlay, dict) and parlay.get("legs"):
+                    st.session_state.parlay_debug.append("🎰 Running fetch_parlay_results_direct...")
                     fetch_parlay_results_direct(check_date_str, status)
                     
-                    # Check again after direct fetch
+                    # Log final state
                     parlay = st.session_state.parlay_history[check_date_str]
                     final_result = parlay.get("result") if isinstance(parlay, dict) else None
-                    st.session_state.parlay_debug.append(f"🎯 After direct fetch: result={final_result}")
+                    final_legs_hit = parlay.get("legs_hit") if isinstance(parlay, dict) else None
+                    st.session_state.parlay_debug.append(f"🎯 Final: result={final_result}, legs_hit={final_legs_hit}")
+                    
+                    # Check if legs have actuals
+                    legs_with_actual = sum(1 for leg in parlay.get("legs", []) if leg.get("actual_sog") is not None)
+                    st.session_state.parlay_debug.append(f"📊 Legs with actual SOG: {legs_with_actual}/{len(parlay.get('legs', []))}")
                 else:
-                    st.session_state.parlay_debug.append(f"✅ Parlay already resolved: {current_result}")
+                    st.session_state.parlay_debug.append("⚠️ Invalid parlay data for this date")
             else:
                 st.session_state.parlay_debug.append("⚠️ No parlay found for this date")
             
@@ -2564,7 +2504,7 @@ def display_results_tracker(threshold: int):
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer V7.7")
+    st.title("🏒 NHL SOG Analyzer V7.8")
     st.caption("Fixed: Verification checks correct date | Retry Save | Better debug logging")
     
     # Sidebar
