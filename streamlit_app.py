@@ -1070,81 +1070,156 @@ def fetch_player_stats(player_info: Dict) -> Optional[Dict]:
 # RESULTS FETCHING (Same as V6)
 # ============================================================================
 def fetch_parlay_results_direct(check_date: str, status_container):
-    """Directly fetch parlay leg results - uses player game logs (most reliable)."""
+    """Directly fetch parlay leg results from boxscores with debug output."""
     if check_date not in st.session_state.parlay_history:
+        status_container.error(f"❌ No parlay found for {check_date}")
         return False
     
     parlay = st.session_state.parlay_history[check_date]
     if not isinstance(parlay, dict) or not parlay.get("legs"):
+        status_container.error(f"❌ Invalid parlay data for {check_date}")
         return False
     
     parlay_threshold = parlay.get("threshold", 2)
     legs = parlay.get("legs", [])
     
-    status_container.info(f"🔍 Fetching results for {len(legs)} parlay legs...")
-    
-    legs_found = 0
-    legs_hit = 0
-    
+    # Build lookup for parlay legs - show what we're looking for
+    leg_by_id = {}
+    leg_by_name = {}
+    debug_info = []
     for i, leg in enumerate(legs):
-        player_id = leg.get("player_id")
-        player_name = leg.get("player_name", "Unknown")
-        
-        if not player_id:
-            status_container.warning(f"⚠️ No player ID for {player_name}")
-            continue
-        
-        # Fetch player's game log to find the game on check_date
+        pid = str(leg.get("player_id", ""))
+        pname = leg.get("player_name", "").lower().strip()
+        if pid:
+            leg_by_id[pid] = i
+        if pname:
+            leg_by_name[pname] = i
+        debug_info.append(f"{leg.get('player_name', '?')} (ID: {pid})")
+    
+    status_container.info(f"🔍 Looking for: {', '.join(debug_info)}")
+    
+    games = get_todays_schedule(check_date)
+    if not games:
+        status_container.error(f"❌ No games found for {check_date}")
+        return False
+    
+    status_container.write(f"📅 Found {len(games)} games on {check_date}")
+    
+    legs_found = [None] * len(legs)
+    all_players_seen = []
+    finished_games = 0
+    
+    for game in games:
         try:
-            url = f"{NHL_WEB_API}/player/{player_id}/game-log/{SEASON}/{GAME_TYPE}"
-            resp = requests.get(url, timeout=15)
-            
+            box_url = f"{NHL_WEB_API}/gamecenter/{game['id']}/boxscore"
+            resp = requests.get(box_url, timeout=15)
             if resp.status_code != 200:
-                status_container.warning(f"⚠️ Failed to fetch {player_name} game log")
+                status_container.write(f"⚠️ Game {game['id']}: HTTP {resp.status_code}")
                 continue
             
-            game_log = resp.json().get("gameLog", [])
+            box_data = resp.json()
+            game_state = box_data.get("gameState", "")
             
-            # Find the game on check_date
-            actual_sog = None
-            for game in game_log:
-                game_date = game.get("gameDate", "")
-                if game_date == check_date:
-                    actual_sog = game.get("shots", 0)
-                    break
+            if game_state not in ["OFF", "FINAL"]:
+                status_container.write(f"⏳ Game {game['away_team']}@{game['home_team']}: {game_state}")
+                continue
             
-            if actual_sog is not None:
-                leg["actual_sog"] = actual_sog
-                leg["hit"] = 1 if actual_sog >= parlay_threshold else 0
-                legs_found += 1
-                if leg["hit"]:
-                    legs_hit += 1
-                status_container.write(f"✅ {player_name}: {actual_sog} SOG {'✓' if leg['hit'] else '✗'}")
-            else:
-                # Player didn't play that day (DNP, injured, etc.)
-                status_container.write(f"⚠️ {player_name}: No game found on {check_date}")
+            finished_games += 1
+            
+            # Try multiple paths for player stats
+            player_locations = []
+            
+            # Path 1: boxscore.playerByGameStats
+            if "boxscore" in box_data:
+                boxscore = box_data["boxscore"]
+                if "playerByGameStats" in boxscore:
+                    pbgs = boxscore["playerByGameStats"]
+                    for team_key in ["homeTeam", "awayTeam"]:
+                        if team_key in pbgs:
+                            for pos in ["forwards", "defense"]:
+                                if pos in pbgs[team_key]:
+                                    player_locations.extend(pbgs[team_key][pos])
+            
+            # Path 2: playerByGameStats at root
+            if "playerByGameStats" in box_data:
+                pbgs = box_data["playerByGameStats"]
+                for team_key in ["homeTeam", "awayTeam"]:
+                    if team_key in pbgs:
+                        for pos in ["forwards", "defense"]:
+                            if pos in pbgs[team_key]:
+                                player_locations.extend(pbgs[team_key][pos])
+            
+            # Check each player against parlay legs
+            for player in player_locations:
+                pid = player.get("playerId") or player.get("id")
+                pid_str = str(pid) if pid else ""
+                
+                name_data = player.get("name", {})
+                if isinstance(name_data, dict):
+                    player_name = name_data.get("default", "")
+                else:
+                    player_name = str(name_data) if name_data else ""
+                player_name_lower = player_name.lower().strip()
+                
+                actual_sog = player.get("sog", 0) or player.get("shots", 0) or 0
+                
+                # Track all players for debugging
+                all_players_seen.append(f"{player_name}:{pid_str}")
+                
+                # Check if this player is a parlay leg
+                leg_idx = None
+                if pid_str and pid_str in leg_by_id:
+                    leg_idx = leg_by_id[pid_str]
+                elif player_name_lower and player_name_lower in leg_by_name:
+                    leg_idx = leg_by_name[player_name_lower]
+                
+                if leg_idx is not None and legs_found[leg_idx] is None:
+                    legs_found[leg_idx] = actual_sog
+                    hit = "✅" if actual_sog >= parlay_threshold else "❌"
+                    status_container.success(f"{hit} {player_name}: {actual_sog} SOG")
             
             time.sleep(0.05)
         except Exception as e:
-            status_container.warning(f"⚠️ Error fetching {player_name}: {e}")
+            status_container.write(f"⚠️ Error: {str(e)[:50]}")
+            continue
     
-    # Update parlay with results
-    if legs_found > 0:
+    status_container.write(f"📊 Checked {finished_games} finished games, saw {len(all_players_seen)} players")
+    
+    # Debug: show first few players seen if we didn't find our targets
+    found_count = sum(1 for x in legs_found if x is not None)
+    if found_count < len(legs):
+        # Show sample of players we saw
+        sample = all_players_seen[:10]
+        status_container.write(f"🔎 Sample players in boxscores: {', '.join(sample)}")
+    
+    # Update parlay legs with results
+    legs_hit = 0
+    legs_checked = 0
+    for i, leg in enumerate(legs):
+        if legs_found[i] is not None:
+            legs_checked += 1
+            actual = legs_found[i]
+            leg["actual_sog"] = actual
+            leg["hit"] = 1 if actual >= parlay_threshold else 0
+            if leg["hit"]:
+                legs_hit += 1
+    
+    if legs_checked > 0:
         parlay["legs_hit"] = legs_hit
-        parlay["legs_checked"] = legs_found
+        parlay["legs_checked"] = legs_checked
         
-        if legs_found == len(legs):
+        if legs_checked == len(legs):
             parlay["result"] = "WIN" if legs_hit == len(legs) else "LOSS"
             status_container.success(f"🎯 Parlay Result: **{parlay['result']}** ({legs_hit}/{len(legs)} legs hit)")
         else:
-            parlay["result"] = f"PARTIAL ({legs_found}/{len(legs)} legs checked)"
-            status_container.warning(f"⚠️ Only {legs_found}/{len(legs)} legs could be verified")
+            parlay["result"] = f"PARTIAL ({legs_checked}/{len(legs)} legs checked)"
+            status_container.warning(f"⚠️ Only {legs_checked}/{len(legs)} legs could be verified")
         
         st.session_state.parlay_history[check_date] = parlay
         save_parlay_history(st.session_state.parlay_history)
         return True
     
-    status_container.error("❌ Could not find any results")
+    status_container.error(f"❌ Could not find any of the {len(legs)} parlay leg players in boxscores")
     return False
 
 def fetch_results(check_date: str, threshold: int, status_container):
@@ -1853,12 +1928,13 @@ def display_parlays_v7(plays: List[Dict], threshold: int, unit_size: float):
     
     st.markdown("---")
     
-    # Recommended parlay
+    # Recommended parlay - MINIMUM 3 legs for decent odds
     st.subheader("⭐ Recommended Parlay")
     
     # Find best parlay with prob > 30% and within variance limit
+    # Only consider 3+ legs (2 legs has bad odds at sportsbooks)
     best_parlay = None
-    for size in [3, 2, 4, 5]:
+    for size in [3, 4, 5, 6]:  # Start at 3, no 2-leg parlays
         if size > len(eligible):
             continue
         parlay = generate_best_parlay_v7(eligible, size, threshold)
@@ -1866,8 +1942,9 @@ def display_parlays_v7(plays: List[Dict], threshold: int, unit_size: float):
             best_parlay = parlay
             break
     
-    if not best_parlay:
-        best_parlay = generate_best_parlay_v7(eligible, 2, threshold)
+    # Fallback to 3 if nothing better found
+    if not best_parlay and len(eligible) >= 3:
+        best_parlay = generate_best_parlay_v7(eligible, 3, threshold)
     
     if best_parlay:
         col1, col2, col3, col4 = st.columns(4)
@@ -1913,6 +1990,8 @@ def display_parlays_v7(plays: List[Dict], threshold: int, unit_size: float):
         }
         st.session_state.parlay_history[date_str] = parlay_to_save
         save_parlay_history(st.session_state.parlay_history)
+    else:
+        st.warning(f"⚠️ Not enough eligible players for a 3-leg parlay (need 3, have {len(eligible)}). Run analysis with lower filters or wait for more games.")
 
 def display_results_tracker(threshold: int):
     """Display results tracking tab - clean UI."""
@@ -1957,6 +2036,7 @@ def display_results_tracker(threshold: int):
     with col4:
         if st.button("⚙️ Tools", use_container_width=True):
             st.session_state.show_tools = not st.session_state.get("show_tools", False)
+            st.rerun()
     
     st.markdown("---")
     
