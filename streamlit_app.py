@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer V7.4
+NHL Shots on Goal Analyzer V8.0
 ===============================
 STATISTICAL MODEL + HIT RATE SCORING
 
@@ -16,7 +16,7 @@ P(X >= threshold) = 1 - NegBinom.CDF(threshold-1, μ=λ, σ²=player_variance)
 
 Falls back to Poisson if variance ≤ mean (equidispersed).
 
-v7.4 - January 2026 - Matchup Tags (🧱 Suppressor / 🧀 Swiss Cheese)
+v8.0 - January 2026 - Export/Prune data management, parlay save safeguards
 """
 
 import streamlit as st
@@ -38,7 +38,7 @@ import statistics
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="NHL SOG Analyzer V7.9",
+    page_title="NHL SOG Analyzer V8.0",
     page_icon="🏒",
     layout="wide",
     initial_sidebar_state="auto"  # Auto-collapses on mobile, expands on desktop
@@ -2665,8 +2665,8 @@ def display_results_tracker(threshold: int):
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer V7.9")
-    st.caption("Fixed: Verification checks correct date | Retry Save | Better debug logging")
+    st.title("🏒 NHL SOG Analyzer V8.0")
+    st.caption("New: Export/Prune data management | Parlay save safeguards | Bug fixes")
     
     # Sidebar
     with st.sidebar:
