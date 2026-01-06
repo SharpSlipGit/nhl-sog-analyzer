@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer V8.1
+NHL Shots on Goal Analyzer V8.3
 ===============================
-STATISTICAL MODEL + HIT RATE SCORING
+CALIBRATION UPDATE - Based on 24 parlays, 58 legs analysis
 
-KEY FEATURES:
-- TRUE probability via Negative Binomial / Poisson distribution
-- Projection-based λ (expected SOG) adjusted for matchup/venue/PP
-- Parlay Score = quality heuristic (hit rate + situational factors)
-- Prob% = REAL statistical probability (not a transformed score)
+KEY CHANGES (V8.3):
+- GAME DIVERSIFICATION: Max 1 player per game prevents correlated failures
+- PROBLEM PLAYER EXCLUSION: Dorofeyev, Bennett excluded (shutout risk)
+- FLOOR PROTECTION: P10=0 with HR<90% auto-killed
+- RAISED THRESHOLDS: LOCK=90, min parlay score=75
+- LOGISTIC CALIBRATION: A=0.10, B=6.0, cap=92%
 
-PROBABILITY MODEL:
-λ (projection) = weighted_avg × opp_factor × venue_factor × pp_factor
-P(X >= threshold) = 1 - NegBinom.CDF(threshold-1, μ=λ, σ²=player_variance)
+CALIBRATION DATA (Dec 9 - Jan 6):
+- Parlay Record: 15-9 (62.5%) 
+- Leg Hit Rate: 50/58 (86.2%) - excellent!
+- Focus: Improve leg selection quality to boost parlay win rate
 
-Falls back to Poisson if variance ≤ mean (equidispersed).
+PARLAY STRATEGY:
+- Keep 3-4 leg parlays for ~-150 odds (better value than 2-leg at -600)
+- Game diversification prevents correlated failures
+- Problem player exclusion removes known shutout risks
 
+v8.3 - January 2026 - Calibration update (diversification, exclusions, floor protection)
 v8.2 - January 2026 - Fixed prune function (save_history typo)
 """
 
@@ -108,29 +114,53 @@ ELITE_SUPPRESSORS = {"CAR", "FLA", "LAK", "VGK", "COL"}
 # Shot-friendly: Allow high volume (boost projections)  
 SHOT_FRIENDLY = {"SJS", "ANA", "CHI", "CBJ", "PIT"}
 
-# Logistic mapping coefficients (score → probability)
-LOGISTIC_A = 0.09      # Steepness
-LOGISTIC_B = 4.8       # Midpoint shift
+# ==============================================================================
+# V8.3 CALIBRATION CONSTANTS (Based on Dec 9 - Jan 6 analysis: 24 parlays, 58 legs)
+# ==============================================================================
 
-# Tier thresholds (V7.4)
+# Logistic mapping coefficients - CALIBRATED
+# Old: A=0.09, B=4.8 | New: A=0.10, B=6.0 (reduces overconfidence at top)
+LOGISTIC_A = 0.10      # Steepness (was 0.09)
+LOGISTIC_B = 6.0       # Midpoint shift (was 4.8)
+PROB_CAP = 0.92        # Max probability cap (was 0.94, reduced for realism)
+
+# Tier thresholds - RAISED based on calibration
 TIERS = {
-    "🔒 LOCK": 88,
-    "✅ STRONG": 80,
-    "📊 SOLID": 70,
-    "⚠️ RISKY": 60,
+    "🔒 LOCK": 90,      # Raised from 88 (user specified 90)
+    "✅ STRONG": 80,    # Keep at 80
+    "📊 SOLID": 70,     # Keep at 70
+    "⚠️ RISKY": 60,     # Keep at 60
     "❌ AVOID": 0
 }
 
-# Kill switch thresholds (auto-exclude from parlays)
+# Kill switch thresholds - UPDATED
 KILL_SWITCHES = {
-    "min_score": 60,  # Updated for V7.4 thresholds
-    "max_l5_shutouts": 1,  # More than this = kill
-    "max_variance": 2.8,
-    "max_toi_drop_pct": 25,
-    "min_l5_hit_rate": 60,
+    "min_score": 75,           # Raised from 60 - be more selective
+    "max_l5_shutouts": 1,      # Keep strict
+    "max_variance": 3.0,       # Relaxed from 2.8 (backtest showed variance doesn't hurt!)
+    "max_toi_drop_pct": 20,    # Tightened from 25
+    "min_l5_hit_rate": 60,     # Keep at 60%
 }
 
-# Correlation penalties
+# Problem players - BACKTEST IDENTIFIED (hit rate < 70%)
+# NOTE: Only Dorofeyev and Bennett excluded per user request
+# Celebrini and Kyle Connor remain eligible
+PROBLEM_PLAYERS = {
+    8481604: {"name": "Pavel Dorofeyev", "rate": "50%", "issue": "shutout risk"},
+    8477935: {"name": "Sam Bennett", "rate": "67%", "issue": "shutout risk"},
+}
+
+# Parlay configuration - Keep 3+ legs for decent odds (~-150)
+# User prefers 3-4 leg parlays for better odds, not 2-leg (-600)
+PARLAY_CONFIG = {
+    "default_legs": 3,              # Keep at 3 for better odds
+    "max_legs": 5,                  # Allow up to 5 legs
+    "min_score_for_parlay": 75,     # Raised from 60 - be more selective
+    "max_players_same_game": 1,     # NEW: Game diversification prevents correlated failures
+    "exclude_problem_players": True, # Use exclusion list
+}
+
+# Correlation penalties (unchanged - working well)
 CORRELATION_PENALTIES = {
     "same_team": 0.94,
     "same_line": 0.90,
@@ -750,45 +780,82 @@ def calculate_parlay_score_v7(player: Dict, opp_def: Dict, is_home: bool, thresh
     return final_score, edges, risks
 
 # ============================================================================
-# V7: LOGISTIC PROBABILITY MAPPING
+# V8.3: CALIBRATED LOGISTIC PROBABILITY MAPPING
 # ============================================================================
 def score_to_probability(score: float) -> float:
     """
-    Convert parlay score to true probability using logistic function.
+    Convert parlay score to true probability using CALIBRATED logistic function.
+    
+    V8.3 Calibration Update:
+    - A: 0.09 → 0.10 (steeper curve)
+    - B: 4.8 → 6.0 (shift to reduce overconfidence)
+    - Cap: 0.94 → 0.92 (backtest showed 90-95 range hit only 77.8%)
     
     P(hit) = 1 / (1 + e^(-(a × score - b)))
-    
-    Calibrated for Over 1.5 SOG props.
     """
     raw_prob = 1 / (1 + math.exp(-(LOGISTIC_A * score - LOGISTIC_B)))
     
-    # Cap at 94% to prevent overconfidence, floor at 45%
-    return min(0.94, max(0.45, raw_prob))
+    # Cap at 92% to prevent overconfidence (was 94%), floor at 45%
+    return min(PROB_CAP, max(0.45, raw_prob))
 
 # ============================================================================
-# V7: KILL SWITCH CHECK
+# V8.3: PROBLEM PLAYER CHECK
+# ============================================================================
+def is_problem_player(player_id) -> Tuple[bool, Optional[str]]:
+    """
+    Check if player is on the exclusion list based on backtest data.
+    
+    Problem players identified from Dec 9 - Jan 6 analysis:
+    - Hit rate significantly below 86.2% average
+    - Shutout risk or 1-SOG miss pattern
+    
+    Returns: (is_problem: bool, reason: str or None)
+    """
+    player_id_int = int(player_id) if isinstance(player_id, str) else player_id
+    
+    if player_id_int in PROBLEM_PLAYERS:
+        player_info = PROBLEM_PLAYERS[player_id_int]
+        return True, f"Excluded: {player_info['name']} ({player_info['rate']} rate, {player_info['issue']})"
+    return False, None
+
+# ============================================================================
+# V8.3: ENHANCED KILL SWITCH CHECK
 # ============================================================================
 def check_kill_switches(player: Dict, score: float, threshold: int) -> Tuple[bool, str]:
     """
-    Check if player should be excluded from parlays.
+    Enhanced kill switch logic with V8.3 calibration improvements:
+    - Problem player exclusion (NEW)
+    - Floor protection for P10=0 players (NEW)
+    - Raised min score to 75 (was 60)
+    - Relaxed variance check (backtest showed it doesn't hurt)
+    
     Returns (should_kill, reason).
     """
+    player_id = player.get("player_id")
     
-    # Score too low
-    if score < KILL_SWITCHES["min_score"]:
-        return True, f"Score < {KILL_SWITCHES['min_score']}"
+    # Kill Switch 1: Problem player exclusion (NEW in V8.3)
+    if PARLAY_CONFIG.get("exclude_problem_players", True):
+        is_problem, reason = is_problem_player(player_id)
+        if is_problem:
+            return True, reason
     
-    # Too many recent shutouts
+    # Kill Switch 2: Score too low (RAISED threshold)
+    min_score = PARLAY_CONFIG.get("min_score_for_parlay", KILL_SWITCHES["min_score"])
+    if score < min_score:
+        return True, f"Score {score:.1f} < {min_score} min"
+    
+    # Kill Switch 3: Too many recent shutouts
     l5_shutouts = player.get("l5_shutouts", 0)
     if l5_shutouts > KILL_SWITCHES["max_l5_shutouts"]:
         return True, f"{l5_shutouts} shutouts in L5"
     
-    # Extreme variance
+    # Kill Switch 4: Extreme variance (RELAXED based on backtest)
+    # Note: Backtest showed high variance players actually performed BETTER
     std_dev = player.get("std_dev", 1.5)
     if std_dev > KILL_SWITCHES["max_variance"]:
         return True, f"σ = {std_dev:.1f}"
     
-    # TOI dropping significantly
+    # Kill Switch 5: TOI dropping significantly (TIGHTENED)
     l5_toi = player.get("l5_toi", 15)
     avg_toi = player.get("avg_toi", 15)
     if avg_toi > 0:
@@ -796,10 +863,18 @@ def check_kill_switches(player: Dict, score: float, threshold: int) -> Tuple[boo
         if toi_drop > KILL_SWITCHES["max_toi_drop_pct"]:
             return True, f"TOI -{toi_drop:.0f}%"
     
-    # L5 hit rate too low
+    # Kill Switch 6: L5 hit rate too low
     l5_hit = calculate_l5_hit_rate(player, threshold)
     if l5_hit < KILL_SWITCHES["min_l5_hit_rate"]:
         return True, f"L5 hit = {l5_hit:.0f}%"
+    
+    # Kill Switch 7: Floor protection (NEW in V8.3)
+    # 2 of 8 misses were shutouts - P10=0 with low hit rate is risky
+    p10 = player.get("p10", 1)
+    hit_rate_key = f"hit_rate_{threshold}plus"
+    hit_rate = player.get(hit_rate_key, player.get("hit_rate_2plus", 80))
+    if p10 == 0 and hit_rate < 90:
+        return True, f"Floor risk (P10=0, HR={hit_rate:.0f}%)"
     
     return False, ""
 
@@ -1455,7 +1530,12 @@ def fetch_results(check_date: str, threshold: int, status_container):
 # PARLAY GENERATION (V7 Enhanced)
 # ============================================================================
 def generate_best_parlay_v7(plays: List[Dict], num_legs: int, threshold: int) -> Optional[Dict]:
-    """Generate best parlay with V7 correlation adjustments."""
+    """
+    Generate best parlay with V8.3 improvements:
+    - Game diversification (max 1 player per game)
+    - Problem player exclusion
+    - Higher score threshold
+    """
     
     # Filter to parlay-eligible plays (not killed)
     eligible = [p for p in plays if not p.get("killed", False)]
@@ -1465,7 +1545,36 @@ def generate_best_parlay_v7(plays: List[Dict], num_legs: int, threshold: int) ->
     
     # Sort by score
     sorted_plays = sorted(eligible, key=lambda x: x.get("parlay_score", 0), reverse=True)
-    best_legs = sorted_plays[:num_legs]
+    
+    # V8.3: Apply game diversification - max 1 player per game
+    max_per_game = PARLAY_CONFIG.get("max_players_same_game", 1)
+    games_used = {}  # game_id -> count
+    best_legs = []
+    
+    for play in sorted_plays:
+        if len(best_legs) >= num_legs:
+            break
+        
+        # Get game_id - construct from opponent if not available
+        game_id = play.get("game_id", "")
+        if not game_id:
+            # Construct a pseudo game_id from teams
+            team = play.get("player", {}).get("team", play.get("team", ""))
+            opp = play.get("opponent", "")
+            game_id = f"{min(team, opp)}-{max(team, opp)}" if team and opp else ""
+        
+        # Check diversification
+        if game_id:
+            current_count = games_used.get(game_id, 0)
+            if current_count >= max_per_game:
+                continue  # Skip - already have player from this game
+            games_used[game_id] = current_count + 1
+        
+        best_legs.append(play)
+    
+    if len(best_legs) < num_legs:
+        # Not enough diversified legs - fall back to top N
+        best_legs = sorted_plays[:num_legs]
     
     # Calculate probabilities
     probs = [p.get("model_prob", 70) / 100 for p in best_legs]
@@ -1479,6 +1588,10 @@ def generate_best_parlay_v7(plays: List[Dict], num_legs: int, threshold: int) ->
     avg_score = sum(p.get("parlay_score", 0) for p in best_legs) / num_legs
     min_score = min(p.get("parlay_score", 0) for p in best_legs)
     avg_variance = sum(p.get("player", {}).get("std_dev", 1.5) for p in best_legs) / num_legs
+    
+    # V8.3: Check if all legs are from different games
+    unique_games = len(set(games_used.keys())) if games_used else len(best_legs)
+    is_diversified = unique_games >= len(best_legs)
     
     return {
         "legs": best_legs,
@@ -1494,6 +1607,8 @@ def generate_best_parlay_v7(plays: List[Dict], num_legs: int, threshold: int) ->
         "min_parlay_score": min_score,
         "avg_variance": avg_variance,
         "max_recommended_legs": get_max_legs_by_variance(avg_variance),
+        "is_diversified": is_diversified,
+        "unique_games": unique_games,
     }
 
 # ============================================================================
@@ -2665,8 +2780,8 @@ def display_results_tracker(threshold: int):
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer V8.2")
-    st.caption("Fixed: Prune function now works correctly")
+    st.title("🏒 NHL SOG Analyzer V8.3")
+    st.caption("Calibration: Game diversification, floor protection, LOCK=90")
     
     # Sidebar
     with st.sidebar:
@@ -2733,12 +2848,17 @@ def main():
             
             ---
             
-            **V7.4 Tiers:**
-            - 🔒 LOCK: 88+
-            - ✅ STRONG: 80-87
+            **V8.3 Tiers:**
+            - 🔒 LOCK: 90+
+            - ✅ STRONG: 80-89
             - 📊 SOLID: 70-79
             - ⚠️ RISKY: 60-69
             - ❌ AVOID: <60
+            
+            **V8.3 Calibration:**
+            - Game diversification (1 per game)
+            - Problem player exclusion
+            - Floor protection (P10=0, HR<90%)
             """)
         
         st.caption(f"Current: {get_est_datetime().strftime('%I:%M %p EST')}")
