@@ -186,25 +186,41 @@ def jsonbin_load_data(bin_key: str) -> Dict:
 
 def jsonbin_save_data(bin_key: str, data: Dict) -> bool:
     """Save data to JSONBin.io."""
+    # Initialize debug log if needed
+    if "save_debug" not in st.session_state:
+        st.session_state.save_debug = []
+    
     headers = get_jsonbin_headers()
     if not headers:
+        st.session_state.save_debug.append(f"❌ JSONBin headers not configured")
         return False
     
     try:
         bin_id = st.secrets["jsonbin"].get(bin_key)
         if not bin_id:
+            st.session_state.save_debug.append(f"❌ JSONBin bin_id not found for {bin_key}")
             return False
         
         response = requests.put(
             f"{JSONBIN_API_URL}/b/{bin_id}",
             headers=headers,
             json=data,
-            timeout=10
+            timeout=15
         )
         
-        return response.status_code == 200
+        if response.status_code == 200:
+            st.session_state.save_debug.append(f"✅ JSONBin API returned 200 OK for {bin_key}")
+            return True
+        else:
+            st.session_state.save_debug.append(f"❌ JSONBin save failed: HTTP {response.status_code}")
+            try:
+                st.session_state.save_debug.append(f"   Response: {response.text[:200]}")
+            except:
+                pass
+            return False
         
     except Exception as e:
+        st.session_state.save_debug.append(f"❌ JSONBin save exception: {str(e)}")
         return False
 
 def ensure_data_dir():
@@ -255,20 +271,24 @@ def load_parlay_history() -> Dict:
             return {}
     return {}
 
-def save_parlay_history(history: Dict):
-    """Save parlay history to JSONBin (and local JSON as backup)."""
+def save_parlay_history(history: Dict, verify_date: str = None):
+    """Save parlay history to JSONBin (and local JSON as backup).
+    
+    Args:
+        history: Full parlay history dict
+        verify_date: Specific date to verify after save (optional but recommended)
+    """
     # Initialize debug log if needed
     if "save_debug" not in st.session_state:
         st.session_state.save_debug = []
     
-    # Show the result values we're about to save (for latest 5 parlays only to keep it short)
-    recent_dates = sorted(history.keys(), reverse=True)[:5]
-    for date_key in recent_dates:
-        parlay = history.get(date_key)
+    # Log what we're saving for the specific date (if provided)
+    if verify_date and verify_date in history:
+        parlay = history[verify_date]
         if isinstance(parlay, dict):
             result = parlay.get("result")
             legs_hit = parlay.get("legs_hit")
-            st.session_state.save_debug.append(f"📤 Saving {date_key}: result={result}, legs_hit={legs_hit}")
+            st.session_state.save_debug.append(f"📤 Saving {verify_date}: result={result}, legs_hit={legs_hit}")
     
     # Always save to local JSON as backup
     ensure_data_dir()
@@ -278,19 +298,36 @@ def save_parlay_history(history: Dict):
     # Also save to JSONBin if available
     success = jsonbin_save_data("parlay_bin_id", history)
     if success:
-        # VERIFY by reading back immediately
+        # VERIFY by reading back immediately - check the SPECIFIC date we just saved
         time.sleep(0.5)  # Small delay to ensure write completes
         verify_data = jsonbin_load_data("parlay_bin_id")
-        if verify_data and recent_dates:
-            check_date = recent_dates[0]  # Most recent date
+        
+        # Use provided verify_date, or fall back to most recent
+        check_date = verify_date
+        if not check_date:
+            recent_dates = sorted(history.keys(), reverse=True)[:1]
+            check_date = recent_dates[0] if recent_dates else None
+        
+        if verify_data and check_date:
             saved_result = history.get(check_date, {}).get("result") if isinstance(history.get(check_date), dict) else None
             loaded_result = verify_data.get(check_date, {}).get("result") if isinstance(verify_data.get(check_date), dict) else None
-            if saved_result == loaded_result:
-                st.session_state.save_debug.append(f"✅ Verified {check_date}: result={loaded_result}")
+            saved_legs = history.get(check_date, {}).get("legs_hit") if isinstance(history.get(check_date), dict) else None
+            loaded_legs = verify_data.get(check_date, {}).get("legs_hit") if isinstance(verify_data.get(check_date), dict) else None
+            
+            if saved_result == loaded_result and saved_legs == loaded_legs:
+                st.session_state.save_debug.append(f"✅ Verified {check_date}: result={loaded_result}, legs_hit={loaded_legs}")
             else:
-                st.session_state.save_debug.append(f"⚠️ MISMATCH {check_date}: sent={saved_result}, got={loaded_result}")
+                st.session_state.save_debug.append(f"⚠️ MISMATCH {check_date}: sent result={saved_result}/legs={saved_legs}, got result={loaded_result}/legs={loaded_legs}")
+                # RETRY: Try saving again
+                st.session_state.save_debug.append(f"🔄 Retrying save for {check_date}...")
+                time.sleep(0.3)
+                retry_success = jsonbin_save_data("parlay_bin_id", history)
+                if retry_success:
+                    st.session_state.save_debug.append(f"🔄 Retry complete")
+                else:
+                    st.session_state.save_debug.append(f"❌ Retry failed")
         else:
-            st.session_state.save_debug.append("⚠️ Could not verify save")
+            st.session_state.save_debug.append("⚠️ Could not verify save (no data)")
     else:
         st.session_state.save_debug.append("❌ JSONBin save FAILED")
 
@@ -1267,7 +1304,7 @@ def fetch_parlay_results_direct(check_date: str, status_container):
             debug_log.append(f"⚠️ PARTIAL: {legs_checked}/{len(legs)}")
         
         st.session_state.parlay_history[check_date] = parlay
-        save_parlay_history(st.session_state.parlay_history)
+        save_parlay_history(st.session_state.parlay_history, verify_date=check_date)
         st.session_state.parlay_debug = debug_log  # Save debug log
         return True
     
@@ -1441,7 +1478,7 @@ def fetch_results(check_date: str, threshold: int, status_container):
                     else:
                         parlay["result"] = f"PARTIAL ({legs_checked}/{len(parlay['legs'])} matched)"
                     st.session_state.parlay_history[check_date] = parlay
-                    save_parlay_history(st.session_state.parlay_history)
+                    save_parlay_history(st.session_state.parlay_history, verify_date=check_date)
     
     # If parlay still has no result, try direct fetch
     if check_date in st.session_state.parlay_history:
@@ -1788,7 +1825,7 @@ def auto_save_parlay(plays: List[Dict], date_str: str, threshold: int):
             "legs_hit": None,
         }
         st.session_state.parlay_history[date_str] = parlay_to_save
-        save_parlay_history(st.session_state.parlay_history)
+        save_parlay_history(st.session_state.parlay_history, verify_date=date_str)
 
 # ============================================================================
 # DISPLAY FUNCTIONS
@@ -2060,7 +2097,7 @@ def display_parlays_v7(plays: List[Dict], threshold: int, unit_size: float):
             "legs_hit": None,
         }
         st.session_state.parlay_history[date_str] = parlay_to_save
-        save_parlay_history(st.session_state.parlay_history)
+        save_parlay_history(st.session_state.parlay_history, verify_date=date_str)
     else:
         st.warning(f"⚠️ Not enough eligible players for a 3-leg parlay (need 3, have {len(eligible)}). Run analysis with lower filters or wait for more games.")
 
@@ -2121,29 +2158,20 @@ def display_results_tracker(threshold: int):
             st.rerun()
     
     with col3:
-        if st.button("🎰 Fix Parlay", use_container_width=True):
+        # Retry Save button - for when Fetch succeeds locally but JSONBin verification fails
+        if st.button("💾 Retry Save", use_container_width=True):
             if check_date_str in st.session_state.parlay_history:
-                status = st.empty()
-                
-                # Clear previous debug
-                st.session_state.parlay_debug = []
-                st.session_state.parlay_debug.append(f"🎰 Fix Parlay clicked for {check_date_str}")
-                
-                # Get state before
-                parlay_before = st.session_state.parlay_history[check_date_str]
-                result_before = parlay_before.get("result") if isinstance(parlay_before, dict) else None
-                st.session_state.parlay_debug.append(f"📊 Before: result={result_before}")
-                
-                # Run fetch
-                success = fetch_parlay_results_direct(check_date_str, status)
-                
-                # Get state after
-                parlay_after = st.session_state.parlay_history[check_date_str]
-                result_after = parlay_after.get("result") if isinstance(parlay_after, dict) else None
-                st.session_state.parlay_debug.append(f"🎯 After: result={result_after}, success={success}")
-                
-                if success:
+                parlay = st.session_state.parlay_history[check_date_str]
+                if isinstance(parlay, dict) and parlay.get("result"):
+                    st.session_state.save_debug = []
+                    st.session_state.save_debug.append(f"💾 Retry Save clicked for {check_date_str}")
+                    st.session_state.save_debug.append(f"   Session state: result={parlay.get('result')}, legs_hit={parlay.get('legs_hit')}")
+                    
+                    # Force save with verification
+                    save_parlay_history(st.session_state.parlay_history, verify_date=check_date_str)
                     st.rerun()
+                else:
+                    st.warning(f"No resolved result for {check_date_str} - run Fetch first")
             else:
                 st.warning(f"No parlay for {check_date_str}")
     
@@ -2215,7 +2243,7 @@ def display_results_tracker(threshold: int):
                         parlay["result"] = "WIN"
                         parlay["legs_hit"] = legs_hit_input if legs_hit_input > 0 else num_legs
                         st.session_state.parlay_history[check_date_str] = parlay
-                        save_parlay_history(st.session_state.parlay_history)
+                        save_parlay_history(st.session_state.parlay_history, verify_date=check_date_str)
                         st.success("Set to WIN")
                         st.rerun()
                 
@@ -2224,7 +2252,7 @@ def display_results_tracker(threshold: int):
                         parlay["result"] = "LOSS"
                         parlay["legs_hit"] = legs_hit_input
                         st.session_state.parlay_history[check_date_str] = parlay
-                        save_parlay_history(st.session_state.parlay_history)
+                        save_parlay_history(st.session_state.parlay_history, verify_date=check_date_str)
                         st.success("Set to LOSS")
                         st.rerun()
                 
@@ -2233,7 +2261,7 @@ def display_results_tracker(threshold: int):
                         parlay["result"] = "VOID"
                         parlay["legs_hit"] = legs_hit_input
                         st.session_state.parlay_history[check_date_str] = parlay
-                        save_parlay_history(st.session_state.parlay_history)
+                        save_parlay_history(st.session_state.parlay_history, verify_date=check_date_str)
                         st.success("Set to VOID")
                         st.rerun()
         else:
@@ -2536,8 +2564,8 @@ def display_results_tracker(threshold: int):
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer V7.6")
-    st.caption("Team Schedule Validation | Manual Parlay Override | Calibration Tracking")
+    st.title("🏒 NHL SOG Analyzer V7.7")
+    st.caption("Fixed: Verification checks correct date | Retry Save | Better debug logging")
     
     # Sidebar
     with st.sidebar:
