@@ -16,7 +16,7 @@ P(X >= threshold) = 1 - NegBinom.CDF(threshold-1, μ=λ, σ²=player_variance)
 
 Falls back to Poisson if variance ≤ mean (equidispersed).
 
-v8.1 - January 2026 - Fixed Export/Prune button visibility in Tools panel
+v8.2 - January 2026 - Fixed prune function (save_history typo)
 """
 
 import streamlit as st
@@ -38,7 +38,7 @@ import statistics
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="NHL SOG Analyzer V8.1",
+    page_title="NHL SOG Analyzer V8.2",
     page_icon="🏒",
     layout="wide",
     initial_sidebar_state="auto"  # Auto-collapses on mobile, expands on desktop
@@ -2380,7 +2380,7 @@ def display_results_tracker(threshold: int):
                 
                 # Save pruned data to JSONBin
                 save_parlay_history(st.session_state.parlay_history)
-                save_results_history(st.session_state.results_history)
+                save_history(st.session_state.results_history)
                 
                 st.session_state.confirm_prune = False
                 st.success(f"✅ Pruned {len(parlay_to_prune)} parlays and {len(results_to_prune)} result days")
@@ -2665,8 +2665,8 @@ def display_results_tracker(threshold: int):
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer V8.1")
-    st.caption("Fixed: Export/Prune buttons now always visible in Tools")
+    st.title("🏒 NHL SOG Analyzer V8.2")
+    st.caption("Fixed: Prune function now works correctly")
     
     # Sidebar
     with st.sidebar:
