@@ -1499,103 +1499,119 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
     plays = []
     total = len(all_players)
     qualified_count = 0
+    error_count = 0
+    no_games_count = 0
+    low_hit_count = 0
     
     for i, player_info in enumerate(all_players):
         pct = 0.45 + (i / total) * 0.55
         progress_bar.progress(pct)
-        status_text.text(f"🔍 {player_info['name'][:18]}... ({i+1}/{total}) | ✅ {qualified_count} found")
+        status_text.text(f"🔍 {player_info['name'][:18]}... ({i+1}/{total}) | ✅ {qualified_count} found | ❌ {error_count} errors")
         
         # Change quote every ~40 players
         if i % 40 == 0 and i > 0:
             quote_text.caption(f"💬 *\"{random.choice(QUOTES)}\"*")
         
-        stats = fetch_player_stats(player_info)
-        if not stats:
-            continue
+        try:
+            stats = fetch_player_stats(player_info)
+            if not stats:
+                no_games_count += 1
+                continue
+            
+            hit_rate = stats.get(f"hit_rate_{threshold}plus", 0)
+            if hit_rate < MIN_HIT_RATE:
+                low_hit_count += 1
+                continue
+            
+            qualified_count += 1
+            
+            info = game_info.get(player_info["team"])
+            if not info:
+                continue
+            
+            opp = info["opponent"]
+            opp_def = team_defense.get(opp, {"grade": "C", "trend": "stable", "shots_allowed_per_game": 30.0})
+            is_home = info["home_away"] == "HOME"
+            
+            # V7 Parlay Score (continuous)
+            parlay_score, edges, risks = calculate_parlay_score_v7(stats, opp_def, is_home, threshold)
+            
+            # SOG Projection (adjusted for matchup, venue, PP) - used as λ in probability model
+            base_proj = (stats["last_5_avg"] * 0.4) + (stats["last_10_avg"] * 0.3) + (stats["avg_sog"] * 0.3)
+            opp_factor = opp_def.get("shots_allowed_per_game", 30.0) / LEAGUE_AVG_SAG
+            venue_factor = 1.03 if is_home else 0.97
+            pp_factor = 1.10 if stats.get("is_pp1") else 1.0
+            projection = base_proj * opp_factor * venue_factor * pp_factor
+            
+            # STATISTICAL PROBABILITY (Negative Binomial / Poisson model)
+            # Uses projection as expected value (λ) and player's std_dev for dispersion
+            # This is a TRUE probability, not a heuristic
+            std_dev = stats.get("std_dev", 1.5)
+            model_prob = calculate_statistical_probability(projection, std_dev, threshold) * 100
+            
+            # Kill switch check
+            killed, kill_reason = check_kill_switches(stats, parlay_score, threshold)
+            
+            # Determine tier
+            tier = get_tier_from_score(parlay_score)
+            
+            # Build highlights
+            highlights = []
+            if hit_rate >= 92: highlights.append("🎯 Elite Hit")
+            if hit_rate <= 72: highlights.append("⚠️ Low Hit")
+            if stats["last_5_avg"] >= stats["avg_sog"] + 1.5: highlights.append("🔥 ON FIRE")
+            if stats["last_5_avg"] <= stats["avg_sog"] - 1.5: highlights.append("❄️ ICE COLD")
+            if stats.get("l5_toi", 0) > 0 and stats.get("avg_toi", 0) > 0:
+                toi_change = (stats["l5_toi"] - stats["avg_toi"]) / stats["avg_toi"] * 100
+                if toi_change >= 20: highlights.append("📈 TOI Surge")
+                elif toi_change <= -20: highlights.append("📉 TOI Drop")
+            if stats.get("shutout_rate", 0) >= 18: highlights.append("🚨 Shutout Risk")
+            if stats.get("std_dev", 0) >= 2.3: highlights.append("🎲 High Variance")
+            if stats.get("std_dev", 0) <= 0.9: highlights.append("🎯 Consistent")
+            
+            # Tags
+            tags = []
+            if stats.get("is_pp1"): tags.append("⚡")
+            if stats["floor"] >= 1: tags.append("🛡️")
+            if stats["current_streak"] >= 5: tags.append(f"🔥{stats['current_streak']}G")
+            if stats.get("is_b2b"): tags.append("B2B")
+            
+            play = {
+                "player": stats,
+                "player_id": stats["player_id"],
+                "opponent": opp,
+                "opponent_defense": opp_def,
+                "home_away": info["home_away"],
+                "game_time": info["time"],
+                "game_id": info["game_id"],
+                "parlay_score": round(parlay_score, 1),
+                "model_prob": round(model_prob, 1),
+                "projection": round(projection, 2),
+                "tier": tier,
+                "edges": edges,
+                "risks": risks,
+                "highlights": highlights,
+                "tags": " ".join(tags),
+                "killed": killed,
+                "kill_reason": kill_reason,
+            }
+            plays.append(play)
         
-        hit_rate = stats.get(f"hit_rate_{threshold}plus", 0)
-        if hit_rate < MIN_HIT_RATE:
-            continue
-        
-        qualified_count += 1
-        
-        info = game_info.get(player_info["team"])
-        if not info:
-            continue
-        
-        opp = info["opponent"]
-        opp_def = team_defense.get(opp, {"grade": "C", "trend": "stable", "shots_allowed_per_game": 30.0})
-        is_home = info["home_away"] == "HOME"
-        
-        # V7 Parlay Score (continuous)
-        parlay_score, edges, risks = calculate_parlay_score_v7(stats, opp_def, is_home, threshold)
-        
-        # SOG Projection (adjusted for matchup, venue, PP) - used as λ in probability model
-        base_proj = (stats["last_5_avg"] * 0.4) + (stats["last_10_avg"] * 0.3) + (stats["avg_sog"] * 0.3)
-        opp_factor = opp_def.get("shots_allowed_per_game", 30.0) / LEAGUE_AVG_SAG
-        venue_factor = 1.03 if is_home else 0.97
-        pp_factor = 1.10 if stats.get("is_pp1") else 1.0
-        projection = base_proj * opp_factor * venue_factor * pp_factor
-        
-        # STATISTICAL PROBABILITY (Negative Binomial / Poisson model)
-        # Uses projection as expected value (λ) and player's std_dev for dispersion
-        # This is a TRUE probability, not a heuristic
-        std_dev = stats.get("std_dev", 1.5)
-        model_prob = calculate_statistical_probability(projection, std_dev, threshold) * 100
-        
-        # Kill switch check
-        killed, kill_reason = check_kill_switches(stats, parlay_score, threshold)
-        
-        # Determine tier
-        tier = get_tier_from_score(parlay_score)
-        
-        # Build highlights
-        highlights = []
-        if hit_rate >= 92: highlights.append("🎯 Elite Hit")
-        if hit_rate <= 72: highlights.append("⚠️ Low Hit")
-        if stats["last_5_avg"] >= stats["avg_sog"] + 1.5: highlights.append("🔥 ON FIRE")
-        if stats["last_5_avg"] <= stats["avg_sog"] - 1.5: highlights.append("❄️ ICE COLD")
-        if stats.get("l5_toi", 0) > 0 and stats.get("avg_toi", 0) > 0:
-            toi_change = (stats["l5_toi"] - stats["avg_toi"]) / stats["avg_toi"] * 100
-            if toi_change >= 20: highlights.append("📈 TOI Surge")
-            elif toi_change <= -20: highlights.append("📉 TOI Drop")
-        if stats.get("shutout_rate", 0) >= 18: highlights.append("🚨 Shutout Risk")
-        if stats.get("std_dev", 0) >= 2.3: highlights.append("🎲 High Variance")
-        if stats.get("std_dev", 0) <= 0.9: highlights.append("🎯 Consistent")
-        
-        # Tags
-        tags = []
-        if stats.get("is_pp1"): tags.append("⚡")
-        if stats["floor"] >= 1: tags.append("🛡️")
-        if stats["current_streak"] >= 5: tags.append(f"🔥{stats['current_streak']}G")
-        if stats.get("is_b2b"): tags.append("B2B")
-        
-        play = {
-            "player": stats,
-            "player_id": stats["player_id"],
-            "opponent": opp,
-            "opponent_defense": opp_def,
-            "home_away": info["home_away"],
-            "game_time": info["time"],
-            "game_id": info["game_id"],
-            "parlay_score": round(parlay_score, 1),
-            "model_prob": round(model_prob, 1),
-            "projection": round(projection, 2),
-            "tier": tier,
-            "edges": edges,
-            "risks": risks,
-            "highlights": highlights,
-            "tags": " ".join(tags),
-            "killed": killed,
-            "kill_reason": kill_reason,
-        }
-        plays.append(play)
+        except Exception as e:
+            error_count += 1
+            # Log first few errors for debugging
+            if error_count <= 3:
+                st.warning(f"⚠️ Error on {player_info.get('name', '?')}: {str(e)[:50]}")
     
     # Clear loading UI
     progress_bar.empty()
     status_text.empty()
     quote_text.empty()
     gif_container.empty()
+    
+    # Show analysis summary
+    if len(plays) == 0:
+        st.error(f"❌ No plays found! Debug: {total} players checked, {no_games_count} insufficient games, {low_hit_count} below {MIN_HIT_RATE}% hit rate, {error_count} errors")
     
     # Sort by score
     plays.sort(key=lambda x: x.get("parlay_score", 0), reverse=True)
