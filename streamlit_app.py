@@ -182,11 +182,13 @@ def jsonbin_save_data(bin_key: str, data: Dict) -> bool:
     """Save data to JSONBin.io."""
     headers = get_jsonbin_headers()
     if not headers:
+        st.warning("JSONBin headers not configured")
         return False
     
     try:
         bin_id = st.secrets["jsonbin"].get(bin_key)
         if not bin_id:
+            st.warning(f"JSONBin bin_id not found for {bin_key}")
             return False
         
         response = requests.put(
@@ -196,9 +198,13 @@ def jsonbin_save_data(bin_key: str, data: Dict) -> bool:
             timeout=10
         )
         
+        if response.status_code != 200:
+            st.error(f"JSONBin save failed: {response.status_code} - {response.text[:100]}")
+        
         return response.status_code == 200
         
     except Exception as e:
+        st.error(f"JSONBin save exception: {e}")
         return False
 
 def ensure_data_dir():
@@ -2157,9 +2163,28 @@ def display_results_tracker(threshold: int):
                 if result:
                     parlay = st.session_state.parlay_history.get(check_date_str, {})
                     st.success(f"✅ Parlay updated: {parlay.get('result', 'Unknown')}")
+                    st.write(f"**Legs hit:** {parlay.get('legs_hit')}/{parlay.get('num_legs')}")
+                    # Show each leg result
+                    for leg in parlay.get("legs", []):
+                        hit_icon = "✅" if leg.get("hit") == 1 else "❌" if leg.get("hit") == 0 else "?"
+                        st.write(f"  {hit_icon} {leg.get('player_name')}: {leg.get('actual_sog', '?')} SOG")
+                    # Force reload from JSONBin to verify save worked
+                    st.info("Verifying save to cloud...")
+                    verify_data = load_parlay_history()
+                    if check_date_str in verify_data:
+                        verify_parlay = verify_data[check_date_str]
+                        if verify_parlay.get("result"):
+                            st.success(f"✅ Cloud save verified: {verify_parlay.get('result')}")
+                            # Update session state with verified data
+                            st.session_state.parlay_history = verify_data
+                        else:
+                            st.error("❌ Cloud save FAILED - result still null in JSONBin")
+                    else:
+                        st.error(f"❌ Date {check_date_str} not found in cloud data")
+                    # Don't auto-rerun - let user see the debug output
+                    st.info("👆 Scroll up to see debug output. Refresh page to see Historical Performance.")
                 else:
-                    st.warning("Could not fetch parlay results")
-                st.rerun()
+                    st.warning("Could not fetch parlay results - check debug output above")
             else:
                 st.warning(f"No parlay saved for {check_date_str}")
     
