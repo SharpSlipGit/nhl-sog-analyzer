@@ -279,6 +279,8 @@ if 'results_history' not in st.session_state:
     st.session_state.results_history = load_history()
 if 'parlay_history' not in st.session_state:
     st.session_state.parlay_history = load_parlay_history()
+if 'analysis_date' not in st.session_state:
+    st.session_state.analysis_date = datetime.now(EST).strftime("%Y-%m-%d")
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -1710,7 +1712,8 @@ def display_parlays_v7(plays: List[Dict], threshold: int, unit_size: float):
         st.code(copy_text, language=None)
         
         # Save recommended parlay for tracking
-        date_str = get_est_date()
+        # Use the analysis date, not today's date
+        date_str = st.session_state.get("analysis_date", get_est_date())
         parlay_to_save = {
             "date": date_str,
             "threshold": threshold,
@@ -2386,6 +2389,7 @@ def main():
             status = st.container()
             plays = run_analysis_v7(date_str, threshold, status)
             st.session_state.plays = plays
+            st.session_state.analysis_date = date_str  # Store the analysis date
     
     # Display content
     with tab1:
