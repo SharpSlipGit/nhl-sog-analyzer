@@ -38,7 +38,7 @@ import statistics
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="NHL SOG Analyzer V7.4",
+    page_title="NHL SOG Analyzer V7.9",
     page_icon="🏒",
     layout="wide",
     initial_sidebar_state="auto"  # Auto-collapses on mobile, expands on desktop
@@ -281,6 +281,26 @@ def save_parlay_history(history: Dict, verify_date: str = None):
     # Initialize debug log if needed
     if "save_debug" not in st.session_state:
         st.session_state.save_debug = []
+    
+    # SAFEGUARD: Never overwrite a resolved parlay with an unresolved one
+    # This prevents the bug where auto_save_parlay() overwrites fetch results
+    if verify_date and verify_date in history:
+        new_parlay = history[verify_date]
+        new_result = new_parlay.get("result") if isinstance(new_parlay, dict) else None
+        
+        # If we're trying to save result=None, check if cloud already has a result
+        if new_result is None:
+            cloud_data = jsonbin_load_data("parlay_bin_id")
+            if cloud_data and verify_date in cloud_data:
+                existing = cloud_data[verify_date]
+                existing_result = existing.get("result") if isinstance(existing, dict) else None
+                if existing_result in ["WIN", "LOSS"]:
+                    # DON'T overwrite! Preserve the existing resolved parlay
+                    st.session_state.save_debug.append(f"🛡️ BLOCKED: Won't overwrite {verify_date} (existing result={existing_result}) with result=None")
+                    # Update our local history with the cloud data instead
+                    history[verify_date] = existing
+                    st.session_state.parlay_history[verify_date] = existing
+                    return  # Exit without saving
     
     # Log what we're saving for the specific date (if provided)
     if verify_date and verify_date in history:
@@ -1709,6 +1729,31 @@ def auto_save_parlay(plays: List[Dict], date_str: str, threshold: int):
     if not plays:
         return
     
+    # Initialize debug log
+    if "save_debug" not in st.session_state:
+        st.session_state.save_debug = []
+    
+    # CRITICAL: Check BOTH session state AND cloud for existing resolved parlay
+    existing = st.session_state.parlay_history.get(date_str)
+    existing_result = existing.get("result") if isinstance(existing, dict) else None
+    
+    # Also check cloud data (in case session state is stale)
+    if existing_result is None:
+        cloud_data = jsonbin_load_data("parlay_bin_id")
+        if cloud_data and date_str in cloud_data:
+            cloud_parlay = cloud_data[date_str]
+            cloud_result = cloud_parlay.get("result") if isinstance(cloud_parlay, dict) else None
+            if cloud_result in ["WIN", "LOSS"]:
+                # Cloud has resolved result - sync to session state and skip
+                st.session_state.parlay_history[date_str] = cloud_parlay
+                st.session_state.save_debug.append(f"⏭️ Skipping auto_save_parlay for {date_str} - cloud has result: {cloud_result}")
+                return
+    
+    if existing_result is not None:
+        # Parlay already has result (WIN/LOSS/PARTIAL) - don't overwrite
+        st.session_state.save_debug.append(f"⏭️ Skipping auto_save_parlay for {date_str} - already has result: {existing_result}")
+        return
+    
     # VALIDATION: Get teams playing on this date and filter plays
     teams_playing = get_teams_playing_on_date(date_str)
     if teams_playing:
@@ -2015,27 +2060,31 @@ def display_parlays_v7(plays: List[Dict], threshold: int, unit_size: float):
         
         st.code(copy_text, language=None)
         
-        # Save recommended parlay for tracking
-        # Use the analysis date, not today's date
+        # Save recommended parlay for tracking (only if no existing result)
         date_str = st.session_state.get("analysis_date", get_est_date())
-        parlay_to_save = {
-            "date": date_str,
-            "threshold": threshold,
-            "num_legs": best_parlay["num_legs"],
-            "probability": best_parlay["adjusted_prob"],
-            "odds": best_parlay["adjusted_odds"],
-            "legs": [{
-                "player_id": leg["player"]["player_id"],
-                "player_name": leg["player"]["name"],
-                "team": leg["player"]["team"],
-                "score": leg["parlay_score"],
-                "projection": leg.get("projection", 0),
-            } for leg in best_parlay["legs"]],
-            "result": None,  # Will be updated when results fetched
-            "legs_hit": None,
-        }
-        st.session_state.parlay_history[date_str] = parlay_to_save
-        save_parlay_history(st.session_state.parlay_history, verify_date=date_str)
+        existing = st.session_state.parlay_history.get(date_str)
+        existing_result = existing.get("result") if isinstance(existing, dict) else None
+        
+        # Only save if there's no existing resolved parlay for this date
+        if existing_result not in ["WIN", "LOSS"]:
+            parlay_to_save = {
+                "date": date_str,
+                "threshold": threshold,
+                "num_legs": best_parlay["num_legs"],
+                "probability": best_parlay["adjusted_prob"],
+                "odds": best_parlay["adjusted_odds"],
+                "legs": [{
+                    "player_id": leg["player"]["player_id"],
+                    "player_name": leg["player"]["name"],
+                    "team": leg["player"]["team"],
+                    "score": leg["parlay_score"],
+                    "projection": leg.get("projection", 0),
+                } for leg in best_parlay["legs"]],
+                "result": None,  # Will be updated when results fetched
+                "legs_hit": None,
+            }
+            st.session_state.parlay_history[date_str] = parlay_to_save
+            save_parlay_history(st.session_state.parlay_history, verify_date=date_str)
     else:
         st.warning(f"⚠️ Not enough eligible players for a 3-leg parlay (need 3, have {len(eligible)}). Run analysis with lower filters or wait for more games.")
 
@@ -2504,7 +2553,7 @@ def display_results_tracker(threshold: int):
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer V7.8")
+    st.title("🏒 NHL SOG Analyzer V7.9")
     st.caption("Fixed: Verification checks correct date | Retry Save | Better debug logging")
     
     # Sidebar
