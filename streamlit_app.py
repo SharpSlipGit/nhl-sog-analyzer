@@ -2342,10 +2342,10 @@ def display_results_tracker(threshold: int):
     with prune_col1:
         keep_days = st.number_input(
             "Keep last N days", 
-            min_value=7, 
+            min_value=0, 
             max_value=90, 
-            value=30,
-            help="Data older than this will be deleted"
+            value=7,
+            help="Set to 0 to delete ALL data"
         )
     
     with prune_col2:
