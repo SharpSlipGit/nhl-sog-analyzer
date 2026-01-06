@@ -843,6 +843,16 @@ def get_todays_schedule(date_str: str) -> List[Dict]:
     except Exception as e:
         return []
 
+def get_teams_playing_on_date(date_str: str) -> set:
+    """Get set of team abbreviations playing on a given date."""
+    games = get_todays_schedule(date_str)
+    teams = set()
+    for game in games:
+        teams.add(game.get("away_team", ""))
+        teams.add(game.get("home_team", ""))
+    teams.discard("")  # Remove empty string if present
+    return teams
+
 @st.cache_data(ttl=1800)
 def get_team_roster(team_abbrev: str) -> List[Dict]:
     url = f"{NHL_WEB_API}/roster/{team_abbrev}/current"
@@ -1724,6 +1734,19 @@ def auto_save_parlay(plays: List[Dict], date_str: str, threshold: int):
     if not plays:
         return
     
+    # VALIDATION: Get teams playing on this date and filter plays
+    teams_playing = get_teams_playing_on_date(date_str)
+    if teams_playing:
+        # Only include players whose teams are playing on this date
+        validated_plays = [p for p in plays if p.get("team") in teams_playing]
+        if len(validated_plays) < len(plays):
+            excluded = len(plays) - len(validated_plays)
+            # Log excluded players for debugging
+            if "save_debug" not in st.session_state:
+                st.session_state.save_debug = []
+            st.session_state.save_debug.append(f"⚠️ Parlay validation: excluded {excluded} players (teams not playing on {date_str})")
+        plays = validated_plays
+    
     # Filter to eligible plays (LOCK, STRONG, SOLID with score >= 65)
     eligible = [p for p in plays if p["parlay_score"] >= 65 and p["tier"] in ["🔒 LOCK", "✅ STRONG", "📊 SOLID"]]
     
@@ -2170,6 +2193,51 @@ def display_results_tracker(threshold: int):
                 st.session_state.parlay_debug = []
                 st.session_state.save_debug = []
                 st.rerun()
+        
+        # Manual Parlay Override Row
+        st.markdown("##### ✏️ Manual Parlay Override")
+        if check_date_str in st.session_state.parlay_history:
+            parlay = st.session_state.parlay_history[check_date_str]
+            if isinstance(parlay, dict):
+                current_result = parlay.get("result", "None")
+                num_legs = parlay.get("num_legs", len(parlay.get("legs", [])))
+                
+                st.caption(f"Current: **{current_result}** | Legs: {num_legs}")
+                
+                override_col1, override_col2, override_col3, override_col4 = st.columns(4)
+                
+                with override_col1:
+                    legs_hit_input = st.number_input("Legs Hit", min_value=0, max_value=num_legs, 
+                                                     value=parlay.get("legs_hit") or 0, key="manual_legs_hit")
+                
+                with override_col2:
+                    if st.button("✅ Set WIN", use_container_width=True):
+                        parlay["result"] = "WIN"
+                        parlay["legs_hit"] = legs_hit_input if legs_hit_input > 0 else num_legs
+                        st.session_state.parlay_history[check_date_str] = parlay
+                        save_parlay_history(st.session_state.parlay_history)
+                        st.success("Set to WIN")
+                        st.rerun()
+                
+                with override_col3:
+                    if st.button("❌ Set LOSS", use_container_width=True):
+                        parlay["result"] = "LOSS"
+                        parlay["legs_hit"] = legs_hit_input
+                        st.session_state.parlay_history[check_date_str] = parlay
+                        save_parlay_history(st.session_state.parlay_history)
+                        st.success("Set to LOSS")
+                        st.rerun()
+                
+                with override_col4:
+                    if st.button("⚪ Set VOID", use_container_width=True):
+                        parlay["result"] = "VOID"
+                        parlay["legs_hit"] = legs_hit_input
+                        st.session_state.parlay_history[check_date_str] = parlay
+                        save_parlay_history(st.session_state.parlay_history)
+                        st.success("Set to VOID")
+                        st.rerun()
+        else:
+            st.caption(f"No parlay exists for {check_date_str}")
     
     st.markdown("---")
     
@@ -2468,8 +2536,8 @@ def display_results_tracker(threshold: int):
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer V7.5")
-    st.caption("Statistical Model: Negative Binomial/Poisson Probability | Calibration Tracking")
+    st.title("🏒 NHL SOG Analyzer V7.6")
+    st.caption("Team Schedule Validation | Manual Parlay Override | Calibration Tracking")
     
     # Sidebar
     with st.sidebar:
