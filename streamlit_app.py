@@ -2278,6 +2278,118 @@ def display_results_tracker(threshold: int):
             if st.button("Clear Save Log"):
                 st.session_state.save_debug = []
                 st.rerun()
+        
+        # ================================================================
+        # DATA MANAGEMENT: Export & Prune
+        # ================================================================
+        st.markdown("##### 📦 Data Management")
+        
+        export_col1, export_col2, export_col3 = st.columns(3)
+        
+        with export_col1:
+            # Export Parlay History
+            parlay_data = st.session_state.get("parlay_history", {})
+            if parlay_data:
+                parlay_json = json.dumps(parlay_data, indent=2, default=str)
+                st.download_button(
+                    label="📥 Export Parlays",
+                    data=parlay_json,
+                    file_name=f"parlay_history_{get_est_date()}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    help=f"Download {len(parlay_data)} parlay records as JSON"
+                )
+            else:
+                st.button("📥 Export Parlays", disabled=True, use_container_width=True)
+        
+        with export_col2:
+            # Export Results History
+            results_data = st.session_state.get("results_history", {})
+            if results_data:
+                results_json = json.dumps(results_data, indent=2, default=str)
+                st.download_button(
+                    label="📥 Export Results",
+                    data=results_json,
+                    file_name=f"results_history_{get_est_date()}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    help=f"Download {len(results_data)} days of pick results as JSON"
+                )
+            else:
+                st.button("📥 Export Results", disabled=True, use_container_width=True)
+        
+        with export_col3:
+            # Export Both Combined
+            combined_data = {
+                "exported_at": get_est_date(),
+                "parlay_history": st.session_state.get("parlay_history", {}),
+                "results_history": st.session_state.get("results_history", {})
+            }
+            combined_json = json.dumps(combined_data, indent=2, default=str)
+            st.download_button(
+                label="📥 Export ALL",
+                data=combined_json,
+                file_name=f"sharpslip_backup_{get_est_date()}.json",
+                mime="application/json",
+                use_container_width=True,
+                help="Download complete backup (parlays + results)"
+            )
+        
+        # Prune Section
+        st.markdown("##### 🗑️ Prune Old Data")
+        prune_col1, prune_col2, prune_col3 = st.columns([2, 2, 1])
+        
+        with prune_col1:
+            keep_days = st.number_input(
+                "Keep last N days", 
+                min_value=7, 
+                max_value=90, 
+                value=30,
+                help="Data older than this will be deleted"
+            )
+        
+        with prune_col2:
+            cutoff_date = (datetime.now(EST) - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+            
+            # Count records to prune
+            parlay_to_prune = [d for d in st.session_state.get("parlay_history", {}).keys() if d < cutoff_date]
+            results_to_prune = [d for d in st.session_state.get("results_history", {}).keys() if d < cutoff_date]
+            
+            st.caption(f"**Cutoff:** {cutoff_date}")
+            st.caption(f"**Will delete:** {len(parlay_to_prune)} parlays, {len(results_to_prune)} result days")
+        
+        with prune_col3:
+            if st.button("🗑️ Prune", type="secondary", use_container_width=True):
+                st.session_state.confirm_prune = True
+                st.rerun()
+        
+        # Confirmation dialog
+        if st.session_state.get("confirm_prune", False):
+            st.warning(f"⚠️ This will permanently delete {len(parlay_to_prune)} parlays and {len(results_to_prune)} result days older than {cutoff_date}")
+            
+            confirm_col1, confirm_col2 = st.columns(2)
+            with confirm_col1:
+                if st.button("✅ Yes, Delete", type="primary", use_container_width=True):
+                    # Prune parlay history
+                    for date_key in parlay_to_prune:
+                        del st.session_state.parlay_history[date_key]
+                    
+                    # Prune results history
+                    for date_key in results_to_prune:
+                        del st.session_state.results_history[date_key]
+                    
+                    # Save pruned data to JSONBin
+                    save_parlay_history(st.session_state.parlay_history)
+                    save_results_history(st.session_state.results_history)
+                    
+                    st.session_state.confirm_prune = False
+                    st.success(f"✅ Pruned {len(parlay_to_prune)} parlays and {len(results_to_prune)} result days")
+                    st.rerun()
+            
+            with confirm_col2:
+                if st.button("❌ Cancel", use_container_width=True):
+                    st.session_state.confirm_prune = False
+                    st.rerun()
     
     # ================================================================
     # PARLAY RESULT CARD (if exists for selected date)
