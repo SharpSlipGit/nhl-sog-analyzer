@@ -188,17 +188,11 @@ def jsonbin_save_data(bin_key: str, data: Dict) -> bool:
     """Save data to JSONBin.io."""
     headers = get_jsonbin_headers()
     if not headers:
-        if "save_debug" not in st.session_state:
-            st.session_state.save_debug = []
-        st.session_state.save_debug.append("❌ JSONBin headers not configured")
         return False
     
     try:
         bin_id = st.secrets["jsonbin"].get(bin_key)
         if not bin_id:
-            if "save_debug" not in st.session_state:
-                st.session_state.save_debug = []
-            st.session_state.save_debug.append(f"❌ JSONBin bin_id not found for {bin_key}")
             return False
         
         response = requests.put(
@@ -208,22 +202,9 @@ def jsonbin_save_data(bin_key: str, data: Dict) -> bool:
             timeout=10
         )
         
-        if response.status_code != 200:
-            if "save_debug" not in st.session_state:
-                st.session_state.save_debug = []
-            st.session_state.save_debug.append(f"❌ JSONBin save failed: {response.status_code} - {response.text[:100]}")
-            return False
-        
-        # Success!
-        if "save_debug" not in st.session_state:
-            st.session_state.save_debug = []
-        st.session_state.save_debug.append(f"✅ JSONBin save success for {bin_key}")
-        return True
+        return response.status_code == 200
         
     except Exception as e:
-        if "save_debug" not in st.session_state:
-            st.session_state.save_debug = []
-        st.session_state.save_debug.append(f"❌ JSONBin save exception: {e}")
         return False
 
 def ensure_data_dir():
@@ -276,13 +257,42 @@ def load_parlay_history() -> Dict:
 
 def save_parlay_history(history: Dict):
     """Save parlay history to JSONBin (and local JSON as backup)."""
+    # Initialize debug log if needed
+    if "save_debug" not in st.session_state:
+        st.session_state.save_debug = []
+    
+    # Show the result values we're about to save (for latest 5 parlays only to keep it short)
+    recent_dates = sorted(history.keys(), reverse=True)[:5]
+    for date_key in recent_dates:
+        parlay = history.get(date_key)
+        if isinstance(parlay, dict):
+            result = parlay.get("result")
+            legs_hit = parlay.get("legs_hit")
+            st.session_state.save_debug.append(f"📤 Saving {date_key}: result={result}, legs_hit={legs_hit}")
+    
     # Always save to local JSON as backup
     ensure_data_dir()
     with open(PARLAY_HISTORY_FILE, 'w') as f:
         json.dump(history, f, indent=2)
     
     # Also save to JSONBin if available
-    jsonbin_save_data("parlay_bin_id", history)
+    success = jsonbin_save_data("parlay_bin_id", history)
+    if success:
+        # VERIFY by reading back immediately
+        time.sleep(0.5)  # Small delay to ensure write completes
+        verify_data = jsonbin_load_data("parlay_bin_id")
+        if verify_data and recent_dates:
+            check_date = recent_dates[0]  # Most recent date
+            saved_result = history.get(check_date, {}).get("result") if isinstance(history.get(check_date), dict) else None
+            loaded_result = verify_data.get(check_date, {}).get("result") if isinstance(verify_data.get(check_date), dict) else None
+            if saved_result == loaded_result:
+                st.session_state.save_debug.append(f"✅ Verified {check_date}: result={loaded_result}")
+            else:
+                st.session_state.save_debug.append(f"⚠️ MISMATCH {check_date}: sent={saved_result}, got={loaded_result}")
+        else:
+            st.session_state.save_debug.append("⚠️ Could not verify save")
+    else:
+        st.session_state.save_debug.append("❌ JSONBin save FAILED")
 
 def is_cloud_connected() -> bool:
     """Check if JSONBin is properly configured."""
@@ -2058,21 +2068,58 @@ def display_results_tracker(threshold: int):
     with col2:
         if st.button("🔄 Fetch", type="primary", use_container_width=True):
             status = st.empty()
+            
+            # Clear previous parlay debug
+            st.session_state.parlay_debug = []
+            st.session_state.parlay_debug.append(f"🔄 Fetch clicked for {check_date_str}")
+            
             fetch_results(check_date_str, threshold, status)
-            # Also auto-fix parlay if one exists for this date
+            
+            # After fetch_results, check parlay state
             if check_date_str in st.session_state.parlay_history:
                 parlay = st.session_state.parlay_history[check_date_str]
-                if parlay.get("result") is None:  # Only if not already resolved
-                    status.info("🎰 Also fetching parlay results...")
+                current_result = parlay.get("result") if isinstance(parlay, dict) else None
+                st.session_state.parlay_debug.append(f"📊 After fetch_results: result={current_result}")
+                
+                if current_result is None:
+                    status.info("🎰 Parlay still pending - running direct fetch...")
+                    st.session_state.parlay_debug.append("🎰 Calling fetch_parlay_results_direct...")
                     fetch_parlay_results_direct(check_date_str, status)
+                    
+                    # Check again after direct fetch
+                    parlay = st.session_state.parlay_history[check_date_str]
+                    final_result = parlay.get("result") if isinstance(parlay, dict) else None
+                    st.session_state.parlay_debug.append(f"🎯 After direct fetch: result={final_result}")
+                else:
+                    st.session_state.parlay_debug.append(f"✅ Parlay already resolved: {current_result}")
+            else:
+                st.session_state.parlay_debug.append("⚠️ No parlay found for this date")
+            
             st.rerun()
     
     with col3:
         if st.button("🎰 Fix Parlay", use_container_width=True):
             if check_date_str in st.session_state.parlay_history:
                 status = st.empty()
-                result = fetch_parlay_results_direct(check_date_str, status)
-                if result:
+                
+                # Clear previous debug
+                st.session_state.parlay_debug = []
+                st.session_state.parlay_debug.append(f"🎰 Fix Parlay clicked for {check_date_str}")
+                
+                # Get state before
+                parlay_before = st.session_state.parlay_history[check_date_str]
+                result_before = parlay_before.get("result") if isinstance(parlay_before, dict) else None
+                st.session_state.parlay_debug.append(f"📊 Before: result={result_before}")
+                
+                # Run fetch
+                success = fetch_parlay_results_direct(check_date_str, status)
+                
+                # Get state after
+                parlay_after = st.session_state.parlay_history[check_date_str]
+                result_after = parlay_after.get("result") if isinstance(parlay_after, dict) else None
+                st.session_state.parlay_debug.append(f"🎯 After: result={result_after}, success={success}")
+                
+                if success:
                     st.rerun()
             else:
                 st.warning(f"No parlay for {check_date_str}")
@@ -2081,6 +2128,48 @@ def display_results_tracker(threshold: int):
         if st.button("⚙️ Tools", use_container_width=True):
             st.session_state.show_tools = not st.session_state.get("show_tools", False)
             st.rerun()
+    
+    # Show tools panel if enabled
+    if st.session_state.get("show_tools", False):
+        st.markdown("---")
+        st.markdown("##### ⚙️ Tools")
+        tool_col1, tool_col2, tool_col3 = st.columns(3)
+        
+        with tool_col1:
+            if st.button("☁️ Reload from Cloud", use_container_width=True):
+                # Force reload from JSONBin to see what's actually stored
+                cloud_parlay = jsonbin_load_data("parlay_bin_id")
+                if cloud_parlay:
+                    st.session_state.parlay_history = cloud_parlay
+                    st.success("✅ Reloaded from JSONBin")
+                    st.rerun()
+                else:
+                    st.error("❌ Could not load from JSONBin")
+        
+        with tool_col2:
+            if st.button("🔍 Compare Session vs Cloud", use_container_width=True):
+                cloud_parlay = jsonbin_load_data("parlay_bin_id")
+                session_parlay = st.session_state.parlay_history.get(check_date_str)
+                cloud_entry = cloud_parlay.get(check_date_str) if cloud_parlay else None
+                
+                st.markdown(f"**Date: {check_date_str}**")
+                st.markdown("**Session State:**")
+                if isinstance(session_parlay, dict):
+                    st.json({"result": session_parlay.get("result"), "legs_hit": session_parlay.get("legs_hit")})
+                else:
+                    st.write("No data")
+                
+                st.markdown("**JSONBin:**")
+                if isinstance(cloud_entry, dict):
+                    st.json({"result": cloud_entry.get("result"), "legs_hit": cloud_entry.get("legs_hit")})
+                else:
+                    st.write("No data")
+        
+        with tool_col3:
+            if st.button("🗑️ Clear Debug Logs", use_container_width=True):
+                st.session_state.parlay_debug = []
+                st.session_state.save_debug = []
+                st.rerun()
     
     st.markdown("---")
     
@@ -2379,7 +2468,7 @@ def display_results_tracker(threshold: int):
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer V7.4")
+    st.title("🏒 NHL SOG Analyzer V7.5")
     st.caption("Statistical Model: Negative Binomial/Poisson Probability | Calibration Tracking")
     
     # Sidebar
