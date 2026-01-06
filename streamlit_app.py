@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NHL Shots on Goal Analyzer V7.3
+NHL Shots on Goal Analyzer V7.4
 ===============================
 STATISTICAL MODEL + HIT RATE SCORING
 
@@ -16,7 +16,7 @@ P(X >= threshold) = 1 - NegBinom.CDF(threshold-1, μ=λ, σ²=player_variance)
 
 Falls back to Poisson if variance ≤ mean (equidispersed).
 
-v7.3 - January 2026 - Statistical Model Upgrade
+v7.4 - January 2026 - Matchup Tags (🧱 Suppressor / 🧀 Swiss Cheese)
 """
 
 import streamlit as st
@@ -38,7 +38,7 @@ import statistics
 # PAGE CONFIG
 # ============================================================================
 st.set_page_config(
-    page_title="NHL SOG Analyzer V7.3",
+    page_title="NHL SOG Analyzer V7.4",
     page_icon="🏒",
     layout="wide",
     initial_sidebar_state="auto"  # Auto-collapses on mobile, expands on desktop
@@ -102,11 +102,17 @@ PARLAY_HISTORY_FILE = f"{DATA_DIR}/parlay_history.json"
 LEAGUE_AVG_SAG = 30.0  # Shots allowed per game
 LEAGUE_AVG_SOG = 2.8   # Shots on goal per player
 
+# Shot suppression/friendly teams (research-backed)
+# Elite suppressors: Limit shots via possession/structure (reduce projections)
+ELITE_SUPPRESSORS = {"CAR", "FLA", "LAK", "VGK", "COL"}
+# Shot-friendly: Allow high volume (boost projections)  
+SHOT_FRIENDLY = {"SJS", "ANA", "CHI", "CBJ", "PIT"}
+
 # Logistic mapping coefficients (score → probability)
 LOGISTIC_A = 0.09      # Steepness
 LOGISTIC_B = 4.8       # Midpoint shift
 
-# Tier thresholds (V7.3)
+# Tier thresholds (V7.4)
 TIERS = {
     "🔒 LOCK": 88,
     "✅ STRONG": 80,
@@ -117,7 +123,7 @@ TIERS = {
 
 # Kill switch thresholds (auto-exclude from parlays)
 KILL_SWITCHES = {
-    "min_score": 60,  # Updated for V7.3 thresholds
+    "min_score": 60,  # Updated for V7.4 thresholds
     "max_l5_shutouts": 1,  # More than this = kill
     "max_variance": 2.8,
     "max_toi_drop_pct": 25,
@@ -471,7 +477,7 @@ def magnitude_scale(diff: float, max_diff: float, base_points: float, penalty_mu
 # ============================================================================
 def calculate_parlay_score_v7(player: Dict, opp_def: Dict, is_home: bool, threshold: int) -> Tuple[float, List[str], List[str]]:
     """
-    V7.3: HIT RATE IS KING scoring model.
+    V7.4: HIT RATE IS KING scoring model.
     
     Base Score: 50 + (hit_rate - 70) × 1.5
     - 70% → 50, 80% → 65, 85% → 72.5, 89% → 78.5, 90% → 80, 95% → 87.5
@@ -1601,6 +1607,9 @@ def run_analysis_v7(date_str: str, threshold: int, status_container) -> List[Dic
             if stats["floor"] >= 1: tags.append("🛡️")
             if stats["current_streak"] >= 5: tags.append(f"🔥{stats['current_streak']}G")
             if stats.get("is_b2b"): tags.append("B2B")
+            # Opponent-based tags
+            if opp in ELITE_SUPPRESSORS: tags.append("🧱")  # Tough matchup - suppressor
+            if opp in SHOT_FRIENDLY: tags.append("🧀")  # Easy matchup - swiss cheese defense
             
             play = {
                 "player": stats,
@@ -1723,7 +1732,7 @@ def auto_save_parlay(plays: List[Dict], date_str: str, threshold: int):
 # DISPLAY FUNCTIONS
 # ============================================================================
 def display_all_results(plays: List[Dict], threshold: int):
-    """Display all results with V7.3 highlighting."""
+    """Display all results with V7.4 highlighting."""
     
     st.subheader(f"📊 All Results - Over {threshold - 0.5} SOG")
     
@@ -1784,7 +1793,7 @@ def display_all_results(plays: List[Dict], threshold: int):
         column_config={
             "Score": st.column_config.TextColumn("Score", width="small"),
             "Player": st.column_config.TextColumn("Player", width="medium"),
-            "Tags": st.column_config.TextColumn("Tags", width="small"),
+            "Tags": st.column_config.TextColumn("Tags", width="small", help="⚡=PP1 | 🛡️=Floor≥1 | 🔥=Streak | B2B=Back-to-back | 🧱=vs Suppressor | 🧀=vs Swiss Cheese"),
             "Hit%": st.column_config.TextColumn("Hit%", width="small"),
             "Cush%": st.column_config.TextColumn("Cush%", width="small"),
             "Shut%": st.column_config.TextColumn("Shut%", width="small"),
@@ -1837,7 +1846,7 @@ def display_all_results(plays: List[Dict], threshold: int):
         })
     csv_df = pd.DataFrame(csv_rows)
     csv = csv_df.to_csv(index=False)
-    st.download_button("📥 Download CSV", csv, f"nhl_sog_v73_{get_est_date()}.csv", "text/csv")
+    st.download_button("📥 Download CSV", csv, f"nhl_sog_v74_{get_est_date()}.csv", "text/csv")
 
 def display_tiered_breakdown(plays: List[Dict], threshold: int):
     """Display plays grouped by tier with edge/risk analysis."""
@@ -2314,7 +2323,7 @@ def display_results_tracker(threshold: int):
 # MAIN APP
 # ============================================================================
 def main():
-    st.title("🏒 NHL SOG Analyzer V7.3")
+    st.title("🏒 NHL SOG Analyzer V7.4")
     st.caption("Statistical Model: Negative Binomial/Poisson Probability | Calibration Tracking")
     
     # Sidebar
@@ -2346,10 +2355,10 @@ def main():
         
         st.markdown("---")
         
-        # V7.3 Model Info
-        with st.expander("ℹ️ V7.3 Statistical Model"):
+        # V7.4 Model Info
+        with st.expander("ℹ️ V7.4 Statistical Model"):
             st.markdown("""
-            **🎲 Probability Model (NEW in V7.3):**
+            **🎲 Probability Model (NEW in V7.4):**
             
             Uses **Negative Binomial distribution** (or Poisson when appropriate):
             
@@ -2382,7 +2391,7 @@ def main():
             
             ---
             
-            **V7.3 Tiers:**
+            **V7.4 Tiers:**
             - 🔒 LOCK: 88+
             - ✅ STRONG: 80-87
             - 📊 SOLID: 70-79
