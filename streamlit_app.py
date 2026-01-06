@@ -188,13 +188,17 @@ def jsonbin_save_data(bin_key: str, data: Dict) -> bool:
     """Save data to JSONBin.io."""
     headers = get_jsonbin_headers()
     if not headers:
-        st.warning("JSONBin headers not configured")
+        if "save_debug" not in st.session_state:
+            st.session_state.save_debug = []
+        st.session_state.save_debug.append("❌ JSONBin headers not configured")
         return False
     
     try:
         bin_id = st.secrets["jsonbin"].get(bin_key)
         if not bin_id:
-            st.warning(f"JSONBin bin_id not found for {bin_key}")
+            if "save_debug" not in st.session_state:
+                st.session_state.save_debug = []
+            st.session_state.save_debug.append(f"❌ JSONBin bin_id not found for {bin_key}")
             return False
         
         response = requests.put(
@@ -205,12 +209,21 @@ def jsonbin_save_data(bin_key: str, data: Dict) -> bool:
         )
         
         if response.status_code != 200:
-            st.error(f"JSONBin save failed: {response.status_code} - {response.text[:100]}")
+            if "save_debug" not in st.session_state:
+                st.session_state.save_debug = []
+            st.session_state.save_debug.append(f"❌ JSONBin save failed: {response.status_code} - {response.text[:100]}")
+            return False
         
-        return response.status_code == 200
+        # Success!
+        if "save_debug" not in st.session_state:
+            st.session_state.save_debug = []
+        st.session_state.save_debug.append(f"✅ JSONBin save success for {bin_key}")
+        return True
         
     except Exception as e:
-        st.error(f"JSONBin save exception: {e}")
+        if "save_debug" not in st.session_state:
+            st.session_state.save_debug = []
+        st.session_state.save_debug.append(f"❌ JSONBin save exception: {e}")
         return False
 
 def ensure_data_dir():
@@ -1077,6 +1090,9 @@ def fetch_player_stats(player_info: Dict) -> Optional[Dict]:
 # ============================================================================
 def fetch_parlay_results_direct(check_date: str, status_container):
     """Directly fetch parlay leg results from boxscores with debug output."""
+    # Store debug info persistently
+    debug_log = []
+    
     if check_date not in st.session_state.parlay_history:
         status_container.error(f"❌ No parlay found for {check_date}")
         return False
@@ -1102,13 +1118,17 @@ def fetch_parlay_results_direct(check_date: str, status_container):
             leg_by_name[pname] = i
         debug_info.append(f"{leg.get('player_name', '?')} (ID: {pid})")
     
+    debug_log.append(f"🔍 Looking for: {', '.join(debug_info)}")
     status_container.info(f"🔍 Looking for: {', '.join(debug_info)}")
     
     games = get_todays_schedule(check_date)
     if not games:
-        status_container.error(f"❌ No games found for {check_date}")
+        debug_log.append(f"❌ No games found for {check_date}")
+        status_container.error(f"❌ No games found for {check_date} - NHL schedule API may not have this date")
+        st.session_state.parlay_debug = debug_log
         return False
     
+    debug_log.append(f"📅 Found {len(games)} games on {check_date}")
     status_container.write(f"📅 Found {len(games)} games on {check_date}")
     
     legs_found = [None] * len(legs)
@@ -1190,6 +1210,7 @@ def fetch_parlay_results_direct(check_date: str, status_container):
             continue
     
     status_container.write(f"📊 Checked {finished_games} finished games, saw {len(all_players_seen)} players")
+    debug_log.append(f"📊 Checked {finished_games} finished games, saw {len(all_players_seen)} players")
     
     # Debug: show first few players seen if we didn't find our targets
     found_count = sum(1 for x in legs_found if x is not None)
@@ -1197,6 +1218,7 @@ def fetch_parlay_results_direct(check_date: str, status_container):
         # Show sample of players we saw
         sample = all_players_seen[:10]
         status_container.write(f"🔎 Sample players in boxscores: {', '.join(sample)}")
+        debug_log.append(f"🔎 Sample: {', '.join(sample)}")
     
     # Update parlay legs with results
     legs_hit = 0
@@ -1209,6 +1231,7 @@ def fetch_parlay_results_direct(check_date: str, status_container):
             leg["hit"] = 1 if actual >= parlay_threshold else 0
             if leg["hit"]:
                 legs_hit += 1
+            debug_log.append(f"{'✅' if leg['hit'] else '❌'} {leg.get('player_name','?')}: {actual} SOG")
     
     if legs_checked > 0:
         parlay["legs_hit"] = legs_hit
@@ -1217,16 +1240,22 @@ def fetch_parlay_results_direct(check_date: str, status_container):
         if legs_checked == len(legs):
             parlay["result"] = "WIN" if legs_hit == len(legs) else "LOSS"
             status_container.success(f"🎯 Parlay Result: **{parlay['result']}** ({legs_hit}/{len(legs)} legs hit)")
+            debug_log.append(f"🎯 Result: {parlay['result']} ({legs_hit}/{len(legs)})")
         else:
             parlay["result"] = f"PARTIAL ({legs_checked}/{len(legs)} legs checked)"
             status_container.warning(f"⚠️ Only {legs_checked}/{len(legs)} legs could be verified")
+            debug_log.append(f"⚠️ PARTIAL: {legs_checked}/{len(legs)}")
         
         st.session_state.parlay_history[check_date] = parlay
         save_parlay_history(st.session_state.parlay_history)
+        st.session_state.parlay_debug = debug_log  # Save debug log
         return True
     
+    debug_log.append(f"❌ Could not find any parlay players in boxscores!")
+    st.session_state.parlay_debug = debug_log  # Save debug log
     status_container.error(f"❌ Could not find any of the {len(legs)} parlay leg players in boxscores")
     return False
+
 
 def fetch_results(check_date: str, threshold: int, status_container):
     """Fetch results for saved picks."""
@@ -2030,6 +2059,12 @@ def display_results_tracker(threshold: int):
         if st.button("🔄 Fetch", type="primary", use_container_width=True):
             status = st.empty()
             fetch_results(check_date_str, threshold, status)
+            # Also auto-fix parlay if one exists for this date
+            if check_date_str in st.session_state.parlay_history:
+                parlay = st.session_state.parlay_history[check_date_str]
+                if parlay.get("result") is None:  # Only if not already resolved
+                    status.info("🎰 Also fetching parlay results...")
+                    fetch_parlay_results_direct(check_date_str, status)
             st.rerun()
     
     with col3:
@@ -2048,6 +2083,27 @@ def display_results_tracker(threshold: int):
             st.rerun()
     
     st.markdown("---")
+    
+    # Show debug log if exists (from last Fix Parlay attempt)
+    if "parlay_debug" in st.session_state and st.session_state.parlay_debug:
+        with st.expander("🔧 Last Parlay Fetch Debug Log", expanded=False):
+            for line in st.session_state.parlay_debug:
+                st.write(line)
+            if st.button("Clear Debug Log"):
+                st.session_state.parlay_debug = []
+                st.rerun()
+    
+    # Show save debug if exists
+    if "save_debug" in st.session_state and st.session_state.save_debug:
+        with st.expander("💾 Save Debug Log", expanded=True):
+            for line in st.session_state.save_debug:
+                if "❌" in line:
+                    st.error(line)
+                else:
+                    st.success(line)
+            if st.button("Clear Save Log"):
+                st.session_state.save_debug = []
+                st.rerun()
     
     # ================================================================
     # PARLAY RESULT CARD (if exists for selected date)
